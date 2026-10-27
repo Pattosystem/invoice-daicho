@@ -299,7 +299,7 @@ function renderForm(ctx, inv) {
         <div class="f"><label>${label}</label>
           <input data-k="${k}" type="${t === "date" ? "date" : "text"}" class="${t === "num" ? "num" : ""}"
                  value="${esc(t === "num" ? fmt(inv[k]) : inv[k])}"></div>`).join("")}
-      <div class="f wide"><label>メモ</label><input data-k="memo" value=""></div>
+      <div class="f wide"><label>メモ</label><input data-k="memo" value="${esc(inv.memo)}"></div>
     </div>
     <h4>明細</h4>
     <table class="items">
@@ -311,8 +311,8 @@ function renderForm(ctx, inv) {
     <div class="alerts"></div>
     <div class="actions">
       <button class="btn" data-act="recheck">再チェック</button>
-      <button class="btn danger" data-act="discard">破棄</button>
-      <button class="btn primary" data-act="save">登録する</button>
+      <button class="btn danger" data-act="discard">${ctx.editId ? "キャンセル" : "破棄"}</button>
+      <button class="btn primary" data-act="save">${ctx.editId ? "変更を保存" : "登録する"}</button>
     </div>`;
   const tbody = $("tbody", form);
   (inv.items?.length ? inv.items : [{}]).forEach(it => addRow(tbody, it));
@@ -322,8 +322,11 @@ function renderForm(ctx, inv) {
     const act = e.target.dataset.act;
     if (act === "addrow") addRow(tbody, {});
     if (act === "recheck") runChecks(ctx);
-    if (act === "discard" && confirm("この取込を破棄しますか？")) ctx.card.remove();
-    if (act === "save") saveInvoice(ctx, e.target);
+    if (act === "discard") {
+      if (ctx.editId) openDetail(ctx.editId);
+      else if (confirm("この取込を破棄しますか？")) ctx.card.remove();
+    }
+    if (act === "save") (ctx.editId ? updateInvoice : saveInvoice)(ctx, e.target);
   });
   form.addEventListener("change", () => runChecks(ctx));
   runChecks(ctx);
@@ -383,7 +386,7 @@ async function runChecks(ctx) {
 
   // 重複チェック（登録済みデータと照合）
   if (v.supplier && v.invoice_no) {
-    const dup = await findDuplicates(v);
+    const dup = await findDuplicates(v, ctx.editId);
     hard.push(...dup.hard); warns.push(...dup.warns);
   }
 
@@ -395,10 +398,10 @@ async function runChecks(ctx) {
     (!hard.length && !warns.length ? `<div class="alert ok">✓ 計算・重複チェックに問題はありません</div>` : "");
 }
 
-async function findDuplicates(v) {
+async function findDuplicates(v, excludeId) {
   const hard = [], warns = [];
   const { data: same } = await sb.from("invoices").select("id,supplier,invoice_no,invoice_date,awb_no,total_amount,currency");
-  const all = same || [];
+  const all = (same || []).filter(r => r.id !== excludeId);
   const sup = norm(v.supplier);
 
   // 1) 同じ取引先・同じ請求書番号 → 登録不可
@@ -532,6 +535,7 @@ function openDetail(id) {
     </div>
     <div class="actions">
       ${r.pdf_path ? `<button class="btn" id="dPdf">PDFを開く</button>` : ""}
+      <button class="btn" id="dEdit">編集</button>
       <button class="btn danger" id="dDel">削除</button>
       <span style="flex:1"></span>
       <button class="btn" id="dClose">閉じる</button>
@@ -539,6 +543,7 @@ function openDetail(id) {
     </div>`;
   $("#modal").classList.remove("hidden");
   $("#dClose").onclick = closeModal;
+  $("#dEdit").onclick = () => editDetail(r);
   if (r.pdf_path) $("#dPdf").onclick = async () => {
     const w = window.open("", "_blank");
     const { data, error } = await sb.storage.from("invoice-pdfs").createSignedUrl(r.pdf_path, 600);
@@ -558,6 +563,52 @@ function openDetail(id) {
     closeModal(); loadLedger();
   };
 }
+// ---------- 登録済みの請求書を編集 ----------
+function editDetail(r) {
+  $("#modalBox").innerHTML = `
+    <h3>${esc(r.supplier)}　${esc(r.invoice_no)} を編集</h3>
+    <div class="meta">内容を書き換えて「変更を保存」を押してください。保存時に計算・重複チェックをかけ直します。</div>
+    <div id="editWrap"><div class="form" style="padding:0;max-height:none"></div></div>`;
+  const ctx = { card: $("#editWrap"), file: null, editId: r.id, status: r.status };
+  renderForm(ctx, { ...r, items: r.invoice_items, notes: [] });
+}
+
+async function updateInvoice(ctx, btn) {
+  await runChecks(ctx);
+  if (ctx.hard.length) { alert("保存できません：\n・" + ctx.hard.join("\n・")); return; }
+  if (ctx.warns.length && !confirm("警告があります。「要確認」として保存しますか？\n\n・" + ctx.warns.join("\n・"))) return;
+
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>保存中…';
+  const v = collect(ctx), id = ctx.editId;
+  try {
+    const { error } = await sb.from("invoices").update({
+      supplier: v.supplier, invoice_no: v.invoice_no, invoice_date: v.invoice_date || null,
+      awb_no: v.awb_no || null, currency: v.currency || null, total_amount: v.total_amount,
+      incoterm: v.incoterm || null, ship_to: v.ship_to || null, memo: v.memo || null,
+      status: ctx.warns.length ? "要確認" : ctx.status,
+      warning_note: ctx.warns.length ? ctx.warns.join("\n") : null,
+    }).eq("id", id);
+    if (error) throw error;
+
+    // 明細は入れ替え（失敗したら元に戻す）
+    const { data: oldItems } = await sb.from("invoice_items").select("*").eq("invoice_id", id);
+    const del = await sb.from("invoice_items").delete().eq("invoice_id", id);
+    if (del.error) throw del.error;
+    const items = v.items.map(r => ({ ...r, invoice_id: id, hs_code: r.hs_code || null, unit: r.unit || null, origin: r.origin || null }));
+    const ins = await sb.from("invoice_items").insert(items);
+    if (ins.error) {
+      if (oldItems?.length) await sb.from("invoice_items").insert(oldItems);
+      throw ins.error;
+    }
+    await loadLedger();
+    openDetail(id);
+  } catch (e) {
+    const msg = String(e.message || e);
+    alert("保存に失敗しました：" + (msg.includes("duplicate") ? "同じ取引先・請求書番号の請求書がすでにあります" : msg));
+    btn.disabled = false; btn.textContent = "変更を保存";
+  }
+}
+
 function closeModal() { $("#modal").classList.add("hidden"); }
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 
