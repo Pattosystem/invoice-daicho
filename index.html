@@ -264,7 +264,7 @@ async function readPdf(ctx) {
   const state = $(".state", ctx.card);
   try {
     const pdf_base64 = await fileToBase64(ctx.file);
-    const { data, error } = await sb.functions.invoke("read-invoice", { body: { pdf_base64 } });
+    const { data, error } = await sb.functions.invoke("bright-endpoint", { body: { pdf_base64 } });
     if (error || !data?.invoice) throw new Error(data?.error || error?.message || "不明なエラー");
     state.textContent = "読み取り完了・内容を確認してください";
     renderForm(ctx, data.invoice);
