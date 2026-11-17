@@ -111,6 +111,13 @@ dl.kv dd{margin:0}
 .sub{color:var(--sub);font-size:11px}
 .pstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}
 .pstats > div{border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.vsw{display:flex;gap:4px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.vsw button{border:1px solid var(--line);background:var(--panel);padding:6px 14px;border-radius:6px;color:var(--sub)}
+.vsw button.on{background:var(--accent-soft);border-color:var(--accent-soft);color:var(--accent);font-weight:700}
+.tag.best{background:var(--ok);color:#fff}
+.tag.old{background:var(--warn-bg);color:var(--warn)}
+.cand{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,2fr) 110px auto;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid #eeece6;font-size:13px}
+.cand select,.cand input{width:100%;padding:5px 7px;border:1px solid var(--line);border-radius:5px;background:#fff}
 .pstats .l{font-size:11px;color:var(--sub)} .pstats .v{font-family:var(--mono);font-size:17px;margin-top:2px}
 
 @media (max-width:860px){
@@ -189,6 +196,32 @@ dl.kv dd{margin:0}
     <!-- 仕入価格（請求書から読むだけ。請求書のデータは書き換えません） -->
     <section id="tab-price" class="hidden">
       <div class="fx" id="fxBox"></div>
+      <div class="vsw">
+        <button class="on" data-pv="cmp">仕入先の比較（まとめた商品）</button>
+        <button data-pv="raw">請求書の商品名ごと</button>
+        <span style="flex:1"></span>
+        <button id="linkBtn">まとめていない商品名 <b id="unlinkedN">0</b></button>
+      </div>
+
+      <div id="pv-cmp">
+        <div class="toolbar">
+          <input type="search" id="cmQ" placeholder="商品名・取引先で検索">
+          <select id="cmFilter">
+            <option value="">すべて</option>
+            <option value="notbest">最近の仕入れが最安ではなかった商品</option>
+            <option value="multi">仕入先が2社以上の商品</option>
+          </select>
+          <span class="count" id="cmCount"></span>
+        </div>
+        <div class="tablewrap"><table class="ledger">
+          <thead><tr><th>商品</th><th>比べる単位</th><th>最安の仕入先</th><th style="text-align:right">最安（円／単位）</th>
+            <th>ほかの仕入先</th><th>最近の仕入れ</th><th style="text-align:right">仕入先数</th></tr></thead>
+          <tbody id="cmBody"></tbody></table>
+          <div class="empty hidden" id="cmEmpty">まだまとめた商品がありません。右上の「まとめていない商品名」から、同じ商品を1つにまとめてください。</div></div>
+        <div class="sub" style="margin-top:8px">仕入先ごとの最新の単価を、比べる単位あたり・円換算で比べています。90日以上前の価格には「古い価格」と表示します。</div>
+      </div>
+
+      <div id="pv-raw" class="hidden">
       <div class="toolbar">
         <input type="search" id="prQ" placeholder="商品名・取引先で検索">
         <select id="prSupplier"><option value="">取引先：すべて</option></select>
@@ -218,6 +251,7 @@ dl.kv dd{margin:0}
         <div class="empty hidden" id="prEmpty">該当する商品はありません</div>
       </div>
       <div class="sub" style="margin-top:8px">台帳に登録した請求書の明細から自動で作ります（ここで請求書の内容は変わりません）。前回比は、同じ取引先・同じ通貨の前回の単価と比べています。円換算は上の為替レートで計算します。</div>
+      </div>
     </section>
   </main>
 </div>
@@ -672,10 +706,13 @@ const pctHtml = (p) => p == null ? "" : Math.abs(p) < 0.05 ? `<span class="flat"
 
 async function loadPrices() {
   $("#prCount").innerHTML = '<span class="spinner"></span>読み込み中…';
-  const [inv, fx] = await Promise.all([
+  const [inv, fx, pp, pa] = await Promise.all([
     sb.from("invoices").select("id,supplier,invoice_no,invoice_date,currency,invoice_items(description,quantity,unit,unit_price)"),
     sb.from("fx_rates").select("*"),
+    sb.from("price_products").select("*"),
+    sb.from("price_aliases").select("*"),
   ]);
+  PP = pp.data || []; PA = {}; (pa.data || []).forEach(a => PA[a.alias_key] = a);
   if (inv.error) { $("#prCount").textContent = ""; alert("読み込みに失敗しました：" + inv.error.message); return; }
   FX = {}; (fx.data || []).forEach(r => FX[r.currency] = Number(r.rate_jpy));
   PR_LINES = [];
@@ -686,7 +723,7 @@ async function loadPrices() {
   }));
   const sel = $("#prSupplier"), cur = sel.value;
   sel.innerHTML = `<option value="">取引先：すべて</option>` + [...new Set(PR_LINES.map(l => l.supplier))].sort().map(x => `<option ${x === cur ? "selected" : ""}>${esc(x)}</option>`).join("");
-  drawFx(); buildPrices(); drawPrices();
+  drawFx(); buildPrices(); drawPrices(); buildCompare(); drawCompare();
 }
 
 function drawFx() {
@@ -703,7 +740,7 @@ function drawFx() {
     const { error } = await sb.from("fx_rates").upsert(rows, { onConflict: "currency" });
     if (error) { alert("保存に失敗しました：" + error.message); return; }
     rows.forEach(r => FX[r.currency] = r.rate_jpy);
-    drawFx(); buildPrices(); drawPrices();
+    drawFx(); buildPrices(); drawPrices(); buildCompare(); drawCompare();
   };
 }
 
@@ -767,6 +804,176 @@ function openPrice(key) {
     <div class="actions"><button class="btn" id="prClose">閉じる</button></div>`;
   $("#modal").classList.remove("hidden");
   $("#prClose").onclick = closeModal;
+}
+
+// ---------- 仕入先の比較（まとめた商品） ----------
+let PP = [], PA = {}, CMP = [];
+const aliasKey = (supplier, name) => prKey(supplier) + "|" + prKey(name);
+const supKey = (s) => String(s ?? "").toUpperCase().replace(/\(.*?\)/g, " ").replace(/\b(CO|LTD|INC|AG|LIMITED|CORP|GMBH|SA|SRL)\b/g, "").replace(/[^A-Z0-9]/g, "");
+document.querySelectorAll("[data-pv]").forEach(b => b.onclick = () => {
+  document.querySelectorAll("[data-pv]").forEach(x => x.classList.toggle("on", x === b));
+  $("#pv-cmp").classList.toggle("hidden", b.dataset.pv !== "cmp");
+  $("#pv-raw").classList.toggle("hidden", b.dataset.pv !== "raw");
+});
+["cmQ", "cmFilter"].forEach(id => $("#" + id).addEventListener("input", drawCompare));
+
+function buildCompare() {
+  // 取引先＋商品名ごとに、まとめた商品へ割り当てる
+  const unlinked = new Map();
+  const byProd = new Map(PP.map(p => [p.id, { p, lines: [] }]));
+  PR_LINES.forEach(l => {
+    const a = PA[aliasKey(l.supplier, l.name)];
+    if (a && byProd.has(a.product_id)) {
+      const per = l.price / (Number(a.units) || 1);
+      byProd.get(a.product_id).lines.push({ ...l, units: Number(a.units) || 1, per, perYen: jpy(per, l.currency) });
+    } else {
+      const k = aliasKey(l.supplier, l.name);
+      const u = unlinked.get(k) || { key: k, supplier: l.supplier, name: l.name, last: l, count: 0 };
+      u.count++; if (l.date >= u.last.date) u.last = l; unlinked.set(k, u);
+    }
+  });
+  UNLINKED = [...unlinked.values()].sort((a, b) => b.last.date.localeCompare(a.last.date));
+  $("#unlinkedN").textContent = UNLINKED.length;
+  const limit = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  CMP = [...byProd.values()].map(({ p, lines }) => {
+    lines.sort((a, b) => a.date.localeCompare(b.date));
+    const sup = new Map();
+    lines.forEach(l => { const k = supKey(l.supplier) || l.supplier; sup.set(k, l); }); // 仕入先ごとの最新
+    const latestBy = [...sup.values()].map(l => ({ ...l, old: l.date < limit }));
+    const priced = latestBy.filter(l => l.perYen != null).sort((a, b) => a.perYen - b.perYen);
+    const best = priced[0] || null;
+    const last = lines[lines.length - 1] || null;
+    const lastIsBest = !!(best && last && supKey(last.supplier) === supKey(best.supplier));
+    return { p, lines, latestBy, priced, best, last, lastIsBest };
+  });
+}
+let UNLINKED = [];
+const diffTxt = (l, best) => { if (!best || l.perYen == null || l === best) return ""; const d = l.perYen - best.perYen;
+  return `+${fmtYen(d)}（+${(d / best.perYen * 100).toFixed(1)}%）`; };
+function drawCompare() {
+  const q = norm($("#cmQ").value), fl = $("#cmFilter").value;
+  const list = CMP.filter(c => (!q || norm(c.p.name + " " + c.latestBy.map(l => l.supplier + " " + l.name).join(" ")).includes(q)) &&
+    (fl === "notbest" ? (c.best && c.last && !c.lastIsBest) : fl === "multi" ? c.latestBy.length > 1 : true))
+    .sort((a, b) => (b.last?.date || "").localeCompare(a.last?.date || ""));
+  $("#cmCount").textContent = `${list.length} 商品`;
+  $("#cmEmpty").classList.toggle("hidden", list.length > 0);
+  $("#cmBody").innerHTML = list.map(c => {
+    const others = c.priced.slice(1).map(l => `${esc(l.supplier.slice(0, 18))} <span class="up">${diffTxt(l, c.best)}</span>`).join("<br>")
+      + c.latestBy.filter(l => l.perYen == null).map(l => `<br>${esc(l.supplier.slice(0, 18))} <span class="sub">（為替レート未設定）</span>`).join("");
+    return `<tr data-pid="${c.p.id}">
+      <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis"><b>${esc(c.p.name)}</b></td><td>1${esc(c.p.compare_unit)}</td>
+      <td>${c.best ? `<span class="tag best">最安</span> ${esc(c.best.supplier)} ${c.best.old ? `<span class="tag old">古い価格</span>` : ""}` : `<span class="sub">比べられる価格なし</span>`}</td>
+      <td class="num">${c.best ? fmtYen(c.best.perYen) : ""}<div class="sub">${c.best ? fmtPrice(c.best.per) + " " + esc(c.best.currency) + "・" + esc(c.best.date) : ""}</div></td>
+      <td style="white-space:normal;min-width:220px;font-size:12px">${others || `<span class="sub">—</span>`}</td>
+      <td>${c.last ? `${esc(c.last.date)}<br>${c.best ? (c.lastIsBest ? `<span class="tag done">最安で購入</span>` : `<span class="tag need">最安ではない</span>`) : ""}` : ""}</td>
+      <td class="num">${c.latestBy.length}</td></tr>`; }).join("");
+  document.querySelectorAll("#cmBody tr").forEach(tr => tr.onclick = () => openCompare(tr.dataset.pid));
+}
+
+function openCompare(pid) {
+  const c = CMP.find(x => x.p.id === pid); if (!c) return;
+  const aliases = Object.values(PA).filter(a => a.product_id === pid);
+  $("#modalBox").innerHTML = `
+    <h3>${esc(c.p.name)}</h3>
+    <div class="meta">比べる単位：1${esc(c.p.compare_unit)}　／　まとめた商品名 ${aliases.length}件</div>
+    <h4>仕入先ごとの最新単価（1${esc(c.p.compare_unit)}あたり・安い順）</h4>
+    <div class="tablewrap"><table class="ledger">
+      <thead><tr><th></th><th>取引先</th><th>最終仕入日</th><th style="text-align:right">請求書の単価</th><th style="text-align:right">1${esc(c.p.compare_unit)}あたり</th><th style="text-align:right">円換算</th><th style="text-align:right">最安との差</th></tr></thead>
+      <tbody>${[...c.priced, ...c.latestBy.filter(l => l.perYen == null)].map((l, i) => `<tr>
+        <td>${i === 0 && l.perYen != null ? `<span class="tag best">最安</span>` : ""}${l.old ? ` <span class="tag old">古い価格</span>` : ""}</td>
+        <td>${esc(l.supplier)}</td><td class="mono">${esc(l.date)}</td>
+        <td class="num">${fmtPrice(l.price)} ${esc(l.currency)}${l.units !== 1 ? `<div class="sub">÷${fmtQty(l.units)}</div>` : ""}</td>
+        <td class="num">${fmtPrice(l.per)} ${esc(l.currency)}</td><td class="num">${l.perYen == null ? `<span class="sub">レート未設定</span>` : fmtYen(l.perYen)}</td>
+        <td class="num up">${diffTxt(l, c.best)}</td></tr>`).join("")}</tbody></table></div>
+    <h4>仕入の履歴（新しい順）</h4>
+    <div class="tablewrap" style="max-height:260px"><table class="ledger">
+      <thead><tr><th>請求日</th><th>取引先</th><th>請求書番号</th><th style="text-align:right">数量</th><th style="text-align:right">1${esc(c.p.compare_unit)}あたり</th><th style="text-align:right">円換算</th></tr></thead>
+      <tbody>${[...c.lines].reverse().map(l => `<tr><td class="mono">${esc(l.date)}</td><td>${esc(l.supplier)}</td><td class="mono">${esc(l.invoice_no)}</td>
+        <td class="num">${fmtQty(l.qty)} ${esc(l.unit ?? "")}</td><td class="num">${fmtPrice(l.per)} ${esc(l.currency)}</td><td class="num">${fmtYen(l.perYen)}</td></tr>`).join("")}</tbody></table></div>
+    <h4>まとめた商品名</h4>
+    <div class="tablewrap"><table class="ledger"><thead><tr><th>取引先</th><th>請求書の商品名</th><th style="text-align:right">請求書の1単位＝</th><th></th></tr></thead>
+      <tbody>${aliases.map(a => `<tr><td>${esc(a.supplier ?? "")}</td><td style="white-space:normal">${esc(a.description ?? "")}</td>
+        <td class="num">${fmtQty(a.units)}${esc(c.p.compare_unit)}</td><td><button class="btn" data-unlink="${esc(a.alias_key)}">外す</button></td></tr>`).join("")}</tbody></table></div>
+    <div class="actions">
+      <button class="btn" id="cpRename">商品名・単位を変える</button>
+      <span style="flex:1"></span><button class="btn" id="cpClose">閉じる</button>
+    </div>`;
+  $("#modal").classList.remove("hidden");
+  $("#cpClose").onclick = closeModal;
+  $("#cpRename").onclick = async () => {
+    const name = prompt("まとめた商品名", c.p.name); if (name === null || !name.trim()) return;
+    const unit = prompt("比べる単位（本・箱・ml など）", c.p.compare_unit); if (unit === null || !unit.trim()) return;
+    const { error } = await sb.from("price_products").update({ name: name.trim(), compare_unit: unit.trim() }).eq("id", pid);
+    if (error) { alert("保存に失敗しました：" + error.message); return; }
+    c.p.name = name.trim(); c.p.compare_unit = unit.trim(); buildCompare(); drawCompare(); openCompare(pid);
+  };
+  $("#modalBox").querySelectorAll("[data-unlink]").forEach(b => b.onclick = async () => {
+    if (!confirm("この商品名を、まとめから外しますか？（請求書のデータは変わりません）")) return;
+    const { error } = await sb.from("price_aliases").delete().eq("alias_key", b.dataset.unlink);
+    if (error) { alert("失敗しました：" + error.message); return; }
+    delete PA[b.dataset.unlink]; buildCompare(); drawCompare();
+    if (Object.values(PA).some(a => a.product_id === pid)) openCompare(pid); else closeModal();
+  });
+}
+
+// ---------- まとめる（名寄せ） ----------
+const tokens = (s) => new Set(String(s ?? "").toUpperCase().replace(/\(.*?\)/g, " ").split(/[^A-Z0-9\u3040-\u30FF\u4E00-\u9FFF]+/).filter(t => t.length >= 2 && !/^(SKU|GTIN|ML|X|PCS|EA)$/.test(t)));
+function suggest(name) {
+  const t = tokens(name); let best = null, bs = 0;
+  PP.forEach(p => {
+    const cands = [p.name, ...Object.values(PA).filter(a => a.product_id === p.id).map(a => a.description)];
+    cands.forEach(c => { const u = tokens(c); let n = 0; t.forEach(x => { if (u.has(x)) n++; }); const sc = n / Math.max(1, Math.min(t.size, u.size)); if (sc > bs) { bs = sc; best = p; } });
+  });
+  return bs >= 0.5 ? best : null;
+}
+$("#linkBtn").onclick = () => openLinker();
+function openLinker() {
+  const opts = PP.slice().sort((a, b) => a.name.localeCompare(b.name, "ja")).map(p => `<option value="${p.id}">${esc(p.name)}（1${esc(p.compare_unit)}）</option>`).join("");
+  $("#modalBox").innerHTML = `
+    <h3>まとめていない商品名（${UNLINKED.length}件）</h3>
+    <div class="meta">同じ商品は、同じ「まとめた商品」を選んでください。新しい商品なら「＋新しい商品として作る」を選びます。<br>
+      「請求書の1単位＝」には、請求書の数量1つが比べる単位いくつにあたるかを入れます（例：1箱に5本入りで、比べる単位が「本」なら 5）。</div>
+    <div style="max-height:60vh;overflow:auto">${UNLINKED.map((u, i) => { const sg = suggest(u.name); return `<div class="cand" data-i="${i}">
+      <div><b style="font-weight:500">${esc(u.name)}</b><div class="sub">${esc(u.supplier)}　/　${fmtPrice(u.last.price)} ${esc(u.last.currency)}（${esc(u.last.date)}・${u.count}回）</div></div>
+      <div><select class="lkSel"><option value="">（まだまとめない）</option><option value="__new">＋新しい商品として作る</option>${opts}</select>
+        <input class="lkNew hidden" placeholder="まとめた商品名" value="${esc(u.name.replace(/\s*\(.*$/, ""))}" style="margin-top:4px">
+        <input class="lkUnitName hidden" placeholder="比べる単位（例：本）" value="本" style="margin-top:4px"></div>
+      <div><input class="lkUnits" value="1" title="請求書の1単位＝比べる単位いくつ" style="text-align:right"></div>
+      <div class="sub">${sg ? "候補あり" : ""}</div></div>`; }).join("") || `<div class="empty">すべてまとめ済みです</div>`}</div>
+    <div class="actions"><button class="btn" id="lkClose">閉じる</button><button class="btn primary" id="lkSave">選んだものを保存</button></div>`;
+  $("#modal").classList.remove("hidden");
+  // 候補を最初から選んでおく
+  $("#modalBox").querySelectorAll(".cand").forEach(row => {
+    const u = UNLINKED[Number(row.dataset.i)], sg = suggest(u.name), sel = row.querySelector(".lkSel");
+    if (sg) sel.value = sg.id;
+    sel.onchange = () => { const n = sel.value === "__new"; row.querySelector(".lkNew").classList.toggle("hidden", !n); row.querySelector(".lkUnitName").classList.toggle("hidden", !n); };
+  });
+  $("#lkClose").onclick = closeModal;
+  $("#lkSave").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>保存中…';
+    try {
+      const newByName = {};
+      const rows = [...$("#modalBox").querySelectorAll(".cand")];
+      for (const row of rows) {
+        const u = UNLINKED[Number(row.dataset.i)], v = row.querySelector(".lkSel").value;
+        if (!v) continue;
+        let pid = v;
+        if (v === "__new") {
+          const nm = row.querySelector(".lkNew").value.trim() || u.name, un = row.querySelector(".lkUnitName").value.trim() || "本";
+          if (newByName[nm]) pid = newByName[nm];
+          else {
+            const { data, error } = await sb.from("price_products").insert({ name: nm, compare_unit: un }).select().single();
+            if (error) throw error; PP.push(data); pid = newByName[nm] = data.id;
+          }
+        }
+        const units = Number(String(row.querySelector(".lkUnits").value).replace(/,/g, "")) || 1;
+        const rec = { alias_key: u.key, supplier: u.supplier, description: u.name, product_id: pid, units };
+        const { error } = await sb.from("price_aliases").upsert(rec, { onConflict: "alias_key" });
+        if (error) throw error; PA[u.key] = rec;
+      }
+      buildCompare(); drawCompare(); closeModal();
+    } catch (err) { alert("保存に失敗しました：" + (err.message || err)); btn.disabled = false; btn.textContent = "選んだものを保存"; }
+  };
 }
 
 $("#prCsv").onclick = () => {
