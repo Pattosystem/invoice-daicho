@@ -102,6 +102,17 @@ dl.kv{display:grid;grid-template-columns:110px 1fr 110px 1fr;gap:6px 12px;margin
 dl.kv dt{color:var(--sub);font-size:12px}
 dl.kv dd{margin:0}
 
+/* 仕入価格 */
+.up{color:var(--err)} .down{color:var(--ok)} .flat{color:var(--sub)}
+.fx{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:12px}
+.fx b{font-size:13px}
+.fx .cur{display:flex;gap:4px;align-items:center}
+.fx input{width:96px;padding:5px 7px;border:1px solid var(--line);border-radius:5px;font-family:var(--mono);text-align:right}
+.sub{color:var(--sub);font-size:11px}
+.pstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}
+.pstats > div{border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.pstats .l{font-size:11px;color:var(--sub)} .pstats .v{font-family:var(--mono);font-size:17px;margin-top:2px}
+
 @media (max-width:860px){
   .card-body{grid-template-columns:1fr}
   .card-body iframe{height:380px;border-right:0;border-bottom:1px solid var(--line)}
@@ -130,6 +141,7 @@ dl.kv dd{margin:0}
     <nav>
       <button data-tab="import" class="on">取込</button>
       <button data-tab="ledger">台帳</button>
+      <button data-tab="price">仕入価格</button>
     </nav>
     <div class="who"><span id="userEmail"></span><button class="btn" id="logoutBtn">ログアウト</button></div>
   </header>
@@ -174,6 +186,39 @@ dl.kv dd{margin:0}
         <div class="empty hidden" id="ledgerEmpty">まだ登録がありません</div>
       </div>
     </section>
+    <!-- 仕入価格（請求書から読むだけ。請求書のデータは書き換えません） -->
+    <section id="tab-price" class="hidden">
+      <div class="fx" id="fxBox"></div>
+      <div class="toolbar">
+        <input type="search" id="prQ" placeholder="商品名・取引先で検索">
+        <select id="prSupplier"><option value="">取引先：すべて</option></select>
+        <select id="prFilter">
+          <option value="">すべての商品</option>
+          <option value="up">前回より値上がりした商品</option>
+          <option value="down">前回より値下がりした商品</option>
+        </select>
+        <select id="prSort">
+          <option value="date">最終仕入日の新しい順</option>
+          <option value="change">前回比の大きい順</option>
+          <option value="name">商品名順</option>
+        </select>
+        <button class="btn" id="prCsv">CSV出力</button>
+        <span class="count" id="prCount"></span>
+      </div>
+      <div class="tablewrap">
+        <table class="ledger">
+          <thead><tr>
+            <th>商品名</th><th>最終仕入日</th><th>取引先</th>
+            <th style="text-align:right">最新単価</th><th style="text-align:right">円換算</th>
+            <th style="text-align:right">前回単価</th><th style="text-align:right">前回比</th>
+            <th style="text-align:right">最安（円）</th><th style="text-align:right">最高（円）</th><th style="text-align:right">仕入回数</th>
+          </tr></thead>
+          <tbody id="prBody"></tbody>
+        </table>
+        <div class="empty hidden" id="prEmpty">該当する商品はありません</div>
+      </div>
+      <div class="sub" style="margin-top:8px">台帳に登録した請求書の明細から自動で作ります（ここで請求書の内容は変わりません）。前回比は、同じ取引先・同じ通貨の前回の単価と比べています。円換算は上の為替レートで計算します。</div>
+    </section>
   </main>
 </div>
 
@@ -216,7 +261,9 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
   $("#tab-import").classList.toggle("hidden", b.dataset.tab !== "import");
   $("#tab-ledger").classList.toggle("hidden", b.dataset.tab !== "ledger");
+  $("#tab-price").classList.toggle("hidden", b.dataset.tab !== "price");
   if (b.dataset.tab === "ledger") loadLedger();
+  if (b.dataset.tab === "price") loadPrices();
 });
 
 // ---------- 取込：ファイル受け取り ----------
@@ -610,6 +657,130 @@ async function updateInvoice(ctx, btn) {
 }
 
 function closeModal() { $("#modal").classList.add("hidden"); }
+
+// =========================================================
+// 仕入価格（請求書の明細を読むだけ。書き込むのは為替レートの表だけ）
+// =========================================================
+let PR_LINES = [], PR_PRODUCTS = [], FX = {};
+const prKey = (s) => String(s ?? "").toUpperCase().replace(/[^A-Z0-9\u3040-\u30FF\u4E00-\u9FFF]/g, "");
+const jpy = (price, cur) => price == null ? null : (cur === "JPY" ? Number(price) : (FX[cur] ? Number(price) * FX[cur] : null));
+const fmtYen = (n) => n == null ? "" : "¥" + Math.round(n).toLocaleString("ja-JP");
+const fmtPrice = (n) => n == null ? "" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 4 });
+const pct = (a, b) => (a == null || b == null || !b) ? null : (a - b) / b * 100;
+const pctHtml = (p) => p == null ? "" : Math.abs(p) < 0.05 ? `<span class="flat">±0%</span>`
+  : `<span class="${p > 0 ? "up" : "down"}">${p > 0 ? "▲" : "▼"}${Math.abs(p).toFixed(1)}%</span>`;
+
+async function loadPrices() {
+  $("#prCount").innerHTML = '<span class="spinner"></span>読み込み中…';
+  const [inv, fx] = await Promise.all([
+    sb.from("invoices").select("id,supplier,invoice_no,invoice_date,currency,invoice_items(description,quantity,unit,unit_price)"),
+    sb.from("fx_rates").select("*"),
+  ]);
+  if (inv.error) { $("#prCount").textContent = ""; alert("読み込みに失敗しました：" + inv.error.message); return; }
+  FX = {}; (fx.data || []).forEach(r => FX[r.currency] = Number(r.rate_jpy));
+  PR_LINES = [];
+  inv.data.forEach(v => (v.invoice_items || []).forEach(it => {
+    if (it.unit_price == null || !it.description) return;
+    PR_LINES.push({ key: prKey(it.description), name: it.description, supplier: v.supplier, currency: (v.currency || "").toUpperCase(),
+      date: v.invoice_date || "", invoice_no: v.invoice_no, invoice_id: v.id, qty: it.quantity, unit: it.unit, price: Number(it.unit_price) });
+  }));
+  const sel = $("#prSupplier"), cur = sel.value;
+  sel.innerHTML = `<option value="">取引先：すべて</option>` + [...new Set(PR_LINES.map(l => l.supplier))].sort().map(x => `<option ${x === cur ? "selected" : ""}>${esc(x)}</option>`).join("");
+  drawFx(); buildPrices(); drawPrices();
+}
+
+function drawFx() {
+  const curs = [...new Set(PR_LINES.map(l => l.currency).filter(c => c && c !== "JPY"))].sort();
+  const missing = curs.filter(c => !FX[c]);
+  $("#fxBox").innerHTML = `<b>為替レート（円換算に使用）</b>
+    ${curs.map(c => `<span class="cur">1 ${esc(c)} ＝ ¥<input data-cur="${esc(c)}" value="${FX[c] ?? ""}" placeholder="未設定"></span>`).join("")}
+    <button class="btn" id="fxSave">保存</button>
+    <span class="sub">${missing.length ? `<span class="up">${missing.join("・")} が未設定です（円換算が空欄になります）</span>` : "レートは自分で決めた値を入れてください。変えるとすぐに表の円換算が変わります。"}</span>`;
+  $("#fxSave").onclick = async () => {
+    const rows = [...document.querySelectorAll("#fxBox [data-cur]")].map(i => ({ currency: i.dataset.cur, rate_jpy: Number(String(i.value).replace(/,/g, "")) }))
+      .filter(r => r.rate_jpy > 0).map(r => ({ ...r, updated_at: new Date().toISOString() }));
+    if (!rows.length) { alert("レートを入れてください"); return; }
+    const { error } = await sb.from("fx_rates").upsert(rows, { onConflict: "currency" });
+    if (error) { alert("保存に失敗しました：" + error.message); return; }
+    rows.forEach(r => FX[r.currency] = r.rate_jpy);
+    drawFx(); buildPrices(); drawPrices();
+  };
+}
+
+function buildPrices() {
+  const map = new Map();
+  PR_LINES.forEach(l => { const g = map.get(l.key) || { key: l.key, lines: [] }; g.lines.push(l); map.set(l.key, g); });
+  PR_PRODUCTS = [...map.values()].map(g => {
+    g.lines.sort((a, b) => a.date.localeCompare(b.date) || String(a.invoice_no).localeCompare(String(b.invoice_no)));
+    // 同じ取引先・同じ通貨の前回単価と比べる
+    const lastBy = {};
+    g.lines.forEach(l => { const k = l.supplier + "|" + l.currency; l.prev = lastBy[k] ?? null; l.change = l.prev ? pct(l.price, l.prev.price) : null; l.yen = jpy(l.price, l.currency); lastBy[k] = l; });
+    const latest = g.lines[g.lines.length - 1];
+    const yens = g.lines.map(l => l.yen).filter(v => v != null);
+    return { key: g.key, name: latest.name, latest, lines: g.lines, count: g.lines.length,
+      suppliers: [...new Set(g.lines.map(l => l.supplier))],
+      min: yens.length ? Math.min(...yens) : null, max: yens.length ? Math.max(...yens) : null };
+  });
+}
+
+["prQ", "prSupplier", "prFilter", "prSort"].forEach(id => $("#" + id).addEventListener("input", drawPrices));
+function drawPrices() {
+  const q = norm($("#prQ").value), sup = $("#prSupplier").value, fl = $("#prFilter").value, so = $("#prSort").value;
+  let list = PR_PRODUCTS.filter(p => (!sup || p.suppliers.includes(sup)) &&
+    (!q || norm(p.name + " " + p.suppliers.join(" ")).includes(q)) &&
+    (!fl || (fl === "up" ? p.latest.change > 0.05 : p.latest.change < -0.05)));
+  list.sort(so === "name" ? (a, b) => a.name.localeCompare(b.name, "ja")
+    : so === "change" ? (a, b) => Math.abs(b.latest.change ?? 0) - Math.abs(a.latest.change ?? 0)
+    : (a, b) => b.latest.date.localeCompare(a.latest.date));
+  $("#prCount").textContent = `${list.length} 商品`;
+  $("#prEmpty").classList.toggle("hidden", list.length > 0);
+  $("#prBody").innerHTML = list.map(p => { const l = p.latest; return `<tr data-k="${esc(p.key)}">
+    <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis" title="${esc(p.name)}">${esc(p.name)}</td>
+    <td class="mono">${esc(l.date)}</td>
+    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${esc(l.supplier)}${p.suppliers.length > 1 ? ` <span class="sub">他${p.suppliers.length - 1}社</span>` : ""}</td>
+    <td class="num">${fmtPrice(l.price)} ${esc(l.currency)}</td><td class="num">${fmtYen(l.yen)}</td>
+    <td class="num">${l.prev ? fmtPrice(l.prev.price) + " " + esc(l.prev.currency) : ""}</td><td class="num">${pctHtml(l.change)}</td>
+    <td class="num">${fmtYen(p.min)}</td><td class="num">${fmtYen(p.max)}</td><td class="num">${p.count}</td></tr>`; }).join("");
+  document.querySelectorAll("#prBody tr").forEach(tr => tr.onclick = () => openPrice(tr.dataset.k));
+}
+
+function openPrice(key) {
+  const p = PR_PRODUCTS.find(x => x.key === key); if (!p) return;
+  const rows = [...p.lines].reverse();
+  $("#modalBox").innerHTML = `
+    <h3>${esc(p.name)}</h3>
+    <div class="meta">仕入 ${p.count}回　／　取引先：${p.suppliers.map(esc).join("、")}</div>
+    <div class="pstats">
+      <div><div class="l">最新単価</div><div class="v">${fmtPrice(p.latest.price)} ${esc(p.latest.currency)}</div></div>
+      <div><div class="l">円換算（今のレート）</div><div class="v">${fmtYen(p.latest.yen)}</div></div>
+      <div><div class="l">これまでの最安（円）</div><div class="v">${fmtYen(p.min)}</div></div>
+      <div><div class="l">これまでの最高（円）</div><div class="v">${fmtYen(p.max)}</div></div>
+    </div>
+    <h4>単価の履歴（新しい順）</h4>
+    <div class="tablewrap"><table class="ledger">
+      <thead><tr><th>請求日</th><th>取引先</th><th>請求書番号</th><th style="text-align:right">数量</th><th style="text-align:right">単価</th><th style="text-align:right">円換算</th><th style="text-align:right">前回比</th></tr></thead>
+      <tbody>${rows.map(l => `<tr><td class="mono">${esc(l.date)}</td><td>${esc(l.supplier)}</td><td class="mono">${esc(l.invoice_no)}</td>
+        <td class="num">${fmtQty(l.qty)} ${esc(l.unit ?? "")}</td><td class="num">${fmtPrice(l.price)} ${esc(l.currency)}</td>
+        <td class="num">${fmtYen(l.yen)}</td><td class="num">${pctHtml(l.change)}</td></tr>`).join("")}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:6px">円換算は過去の分も今のレートで計算しています（為替の影響を除いて、単価そのものの変化を比べるため）。</div>
+    <div class="actions"><button class="btn" id="prClose">閉じる</button></div>`;
+  $("#modal").classList.remove("hidden");
+  $("#prClose").onclick = closeModal;
+}
+
+$("#prCsv").onclick = () => {
+  const head = ["商品名", "請求日", "取引先", "請求書番号", "数量", "単位", "単価", "通貨", "円換算", "前回単価", "前回比(%)"];
+  const lines = [head];
+  PR_PRODUCTS.slice().sort((a, b) => a.name.localeCompare(b.name, "ja")).forEach(p => p.lines.forEach(l => lines.push([
+    p.name, l.date, l.supplier, l.invoice_no, l.qty, l.unit, l.price, l.currency, l.yen == null ? "" : Math.round(l.yen),
+    l.prev ? l.prev.price : "", l.change == null ? "" : l.change.toFixed(1)])));
+  const csv = lines.map(r => r.map(c => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" }));
+  a.download = `仕入価格_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+};
 $("#modal").addEventListener("click", e => { if (e.target.id === "modal") closeModal(); });
 
 // ---------- CSV出力（明細1行＝1行） ----------
