@@ -244,7 +244,8 @@ tr.lossrow td{background:var(--err-bg)}
         <select id="prSort">
           <option value="date">最終仕入日の新しい順</option>
           <option value="change">前回比の大きい順</option>
-          <option value="name">商品名順</option>
+          <option value="name">アルファベット順（A→Z）</option>
+          <option value="nameDesc">アルファベット順（Z→A）</option>
         </select>
         <button class="btn" id="prCsv">CSV出力</button>
         <span class="count" id="prCount"></span>
@@ -279,7 +280,8 @@ tr.lossrow td{background:var(--err-bg)}
           <option value="qty">販売数の多い順</option>
           <option value="date">最終受注日の新しい順</option>
           <option value="spread">価格の幅が大きい順</option>
-          <option value="name">商品名順</option>
+          <option value="name">アルファベット順（A→Z）</option>
+          <option value="nameDesc">アルファベット順（Z→A）</option>
         </select>
         <button class="btn" id="spCsv">CSV出力</button>
         <span class="count" id="spCount"></span>
@@ -783,6 +785,7 @@ function closeModal() { $("#modal").classList.add("hidden"); }
 // 仕入価格（請求書の明細を読むだけ。書き込むのは為替レートの表だけ）
 // =========================================================
 let PR_LINES = [], PR_PRODUCTS = [], FX = {};
+const ABC = new Intl.Collator("ja", { sensitivity: "base", numeric: true });
 const prKey = (s) => String(s ?? "").toUpperCase().replace(/[^A-Z0-9\u3040-\u30FF\u4E00-\u9FFF]/g, "");
 const jpy = (price, cur) => price == null ? null : (cur === "JPY" ? Number(price) : (FX[cur] ? Number(price) * FX[cur] : null));
 const fmtYen = (n) => n == null ? "" : "¥" + Math.round(n).toLocaleString("ja-JP");
@@ -853,7 +856,7 @@ function drawPrices() {
   let list = PR_PRODUCTS.filter(p => (!sup || p.suppliers.includes(sup)) &&
     (!q || norm(p.name + " " + p.suppliers.join(" ")).includes(q)) &&
     (!fl || (fl === "up" ? p.latest.change > 0.05 : p.latest.change < -0.05)));
-  list.sort(so === "name" ? (a, b) => a.name.localeCompare(b.name, "ja")
+  list.sort(so === "name" ? (a, b) => ABC.compare(a.name, b.name) : so === "nameDesc" ? (a, b) => ABC.compare(b.name, a.name)
     : so === "change" ? (a, b) => Math.abs(b.latest.change ?? 0) - Math.abs(a.latest.change ?? 0)
     : (a, b) => b.latest.date.localeCompare(a.latest.date));
   $("#prCount").textContent = `${list.length} 商品`;
@@ -1104,7 +1107,7 @@ function drawSalesPrices() {
   const list = SP_LIST.filter(g => !q || norm(g.name + " " + (g.code || "")).includes(q));
   list.sort(so === "date" ? (a, b) => (b.last.order_date || "").localeCompare(a.last.order_date || "")
     : so === "spread" ? (a, b) => (b.max - b.min) / b.max - (a.max - a.min) / a.max
-    : so === "name" ? (a, b) => a.name.localeCompare(b.name, "ja") : (a, b) => b.n - a.n);
+    : so === "name" ? (a, b) => ABC.compare(a.name, b.name) : so === "nameDesc" ? (a, b) => ABC.compare(b.name, a.name) : (a, b) => b.n - a.n);
   $("#spCount").textContent = `${list.length} 商品`;
   $("#spEmpty").classList.toggle("hidden", list.length > 0);
   $("#spBody").innerHTML = list.map(g => `<tr data-k="${esc(g.key)}">
