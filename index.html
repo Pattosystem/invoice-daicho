@@ -115,6 +115,9 @@ dl.kv dd{margin:0}
 .vsw button{border:1px solid var(--line);background:var(--panel);padding:6px 14px;border-radius:6px;color:var(--sub)}
 .vsw button.on{background:var(--accent-soft);border-color:var(--accent-soft);color:var(--accent);font-weight:700}
 .tag.best{background:var(--ok);color:#fff}
+.tag.loss{background:var(--err);color:#fff}
+.tag.low{background:var(--warn-bg);color:var(--warn)}
+tr.lossrow td{background:var(--err-bg)}
 .tag.old{background:var(--warn-bg);color:var(--warn)}
 .cand{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,2fr) 110px auto;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid #eeece6;font-size:13px}
 .cand select,.cand input{width:100%;padding:5px 7px;border:1px solid var(--line);border-radius:5px;background:#fff}
@@ -149,6 +152,7 @@ dl.kv dd{margin:0}
       <button data-tab="import" class="on">取込</button>
       <button data-tab="ledger">台帳</button>
       <button data-tab="price">仕入価格</button>
+      <button data-tab="profit">利益</button>
     </nav>
     <div class="who"><span id="userEmail"></span><button class="btn" id="logoutBtn">ログアウト</button></div>
   </header>
@@ -253,6 +257,42 @@ dl.kv dd{margin:0}
       <div class="sub" style="margin-top:8px">台帳に登録した請求書の明細から自動で作ります（ここで請求書の内容は変わりません）。前回比は、同じ取引先・同じ通貨の前回の単価と比べています。円換算は上の為替レートで計算します。</div>
       </div>
     </section>
+    <!-- 利益（販売データは受注台帳の受注を読むだけ） -->
+    <section id="tab-profit" class="hidden">
+      <div class="fx">
+        <b>比べ方</b>
+        <span class="cur">販売の期間 <select id="pfDays"><option value="30">直近30日</option><option value="90" selected>直近90日</option><option value="180">直近180日</option><option value="365">直近1年</option></select></span>
+        <span class="cur">仕入単価 <select id="pfCost"><option value="avg">平均（直近180日・数量で加重）</option><option value="last">直近の仕入</option><option value="best">最安の仕入先</option></select></span>
+        <span class="cur">注意する粗利率 <input id="pfWarn" value="20" style="width:56px">％未満</span>
+        <span class="sub">円換算は「仕入価格」タブの為替レートを使います。仕入単価に送料・関税は含みません。</span>
+      </div>
+      <div class="vsw">
+        <span style="flex:1"></span>
+        <button id="sLinkBtn">まとめていない販売商品 <b id="sUnlinkedN">0</b></button>
+      </div>
+      <div class="toolbar">
+        <input type="search" id="pfQ" placeholder="商品名で検索">
+        <select id="pfFilter">
+          <option value="">すべて</option>
+          <option value="loss">仕入より安く売った注文がある商品</option>
+          <option value="low">粗利率が注意ライン未満の商品</option>
+        </select>
+        <select id="pfSort">
+          <option value="rate">粗利率の低い順</option>
+          <option value="amount">粗利額の多い順</option>
+          <option value="qty">販売数の多い順</option>
+        </select>
+        <button class="btn" id="pfCsv">CSV出力</button>
+        <span class="count" id="pfCount"></span>
+      </div>
+      <div class="tablewrap"><table class="ledger">
+        <thead><tr><th>商品</th><th>比べる単位</th><th style="text-align:right">仕入単価</th><th style="text-align:right">平均販売単価</th>
+          <th style="text-align:right">最安販売単価</th><th style="text-align:right">1単位の粗利</th><th style="text-align:right">粗利率</th>
+          <th style="text-align:right">販売数</th><th style="text-align:right">粗利額（期間）</th><th>状態</th></tr></thead>
+        <tbody id="pfBody"></tbody></table>
+        <div class="empty hidden" id="pfEmpty">表示できる商品がありません。「仕入価格」タブで商品をまとめ、右上の「まとめていない販売商品」から販売側の商品を結び付けてください。</div></div>
+      <div class="sub" style="margin-top:8px">販売単価は、受注台帳に取り込んだBカートの受注（キャンセル・単価0円を除く）から計算しています。ここで受注台帳や請求書のデータは変わりません。</div>
+    </section>
   </main>
 </div>
 
@@ -296,6 +336,8 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   $("#tab-import").classList.toggle("hidden", b.dataset.tab !== "import");
   $("#tab-ledger").classList.toggle("hidden", b.dataset.tab !== "ledger");
   $("#tab-price").classList.toggle("hidden", b.dataset.tab !== "price");
+  $("#tab-profit").classList.toggle("hidden", b.dataset.tab !== "profit");
+  if (b.dataset.tab === "profit") loadProfit();
   if (b.dataset.tab === "ledger") loadLedger();
   if (b.dataset.tab === "price") loadPrices();
 });
@@ -922,9 +964,9 @@ function suggest(name) {
   const t = tokens(name); let best = null, bs = 0;
   PP.forEach(p => {
     const cands = [p.name, ...Object.values(PA).filter(a => a.product_id === p.id).map(a => a.description)];
-    cands.forEach(c => { const u = tokens(c); let n = 0; t.forEach(x => { if (u.has(x)) n++; }); const sc = n / Math.max(1, Math.min(t.size, u.size)); if (sc > bs) { bs = sc; best = p; } });
+    cands.forEach(c => { const u = tokens(c); let n = 0; t.forEach(x => { if (u.has(x)) n++; }); const sc = n >= 2 ? n / Math.max(1, Math.min(t.size, u.size)) : 0; if (sc > bs) { bs = sc; best = p; } });
   });
-  return bs >= 0.5 ? best : null;
+  return bs >= 0.75 ? best : null;
 }
 $("#linkBtn").onclick = () => openLinker();
 function openLinker() {
@@ -975,6 +1017,185 @@ function openLinker() {
     } catch (err) { alert("保存に失敗しました：" + (err.message || err)); btn.disabled = false; btn.textContent = "選んだものを保存"; }
   };
 }
+
+// =========================================================
+// 利益（仕入：請求書の明細／販売：受注台帳の bcart_orders を読むだけ）
+// =========================================================
+let SALES = [], SA = {}, PROFIT = [], S_UNLINKED = [];
+const salesKey = (code, name) => code ? "C:" + prKey(code) : "N:" + prKey(name);
+let pfWarnVal = 20;
+try { const v = localStorage.getItem("pf_warn"); if (v) pfWarnVal = Number(v); } catch (_) {}
+$("#pfWarn").value = pfWarnVal;
+["pfDays", "pfCost", "pfWarn", "pfQ", "pfFilter", "pfSort"].forEach(id => $("#" + id).addEventListener("input", () => {
+  if (id === "pfWarn") { pfWarnVal = Number($("#pfWarn").value) || 0; try { localStorage.setItem("pf_warn", pfWarnVal); } catch (_) {} }
+  buildProfit(); drawProfit();
+}));
+
+async function loadProfit() {
+  $("#pfCount").innerHTML = '<span class="spinner"></span>読み込み中…';
+  await loadPrices();
+  const out = [];
+  try {
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await sb.from("bcart_orders").select("order_date,product_code,product_name,qty,irisu,unit,unit_price,customer,order_status,order_no").range(from, from + 999);
+      if (error) throw error;
+      out.push(...data); if (data.length < 1000) break;
+    }
+  } catch (e) { $("#pfCount").textContent = ""; alert("受注データを読めませんでした（受注台帳を使っていない場合は表示できません）：" + e.message); return; }
+  const { data: sa } = await sb.from("sales_aliases").select("*");
+  SA = {}; (sa || []).forEach(a => SA[a.alias_key] = a);
+  SALES = out.filter(r => r.order_status !== "キャンセル" && Number(r.unit_price) > 0);
+  buildProfit(); drawProfit();
+}
+
+function costOf(c, mode) {
+  const priced = c.lines.filter(l => l.perYen != null);
+  if (!priced.length) return null;
+  if (mode === "last") return priced[priced.length - 1].perYen;
+  if (mode === "best") return c.best ? c.best.perYen : null;
+  const since = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+  const rec = priced.filter(l => l.date >= since);
+  const use = rec.length ? rec : priced.slice(-1);
+  const w = use.reduce((a, l) => a + (Number(l.qty) || 1) * l.units, 0);
+  return use.reduce((a, l) => a + l.perYen * (Number(l.qty) || 1) * l.units, 0) / w;
+}
+
+function buildProfit() {
+  const since = new Date(Date.now() - Number($("#pfDays").value) * 86400000).toISOString().slice(0, 10);
+  const mode = $("#pfCost").value;
+  const byProd = new Map(CMP.map(c => [c.p.id, { c, sales: [] }]));
+  const unl = new Map();
+  SALES.forEach(r => {
+    const k = salesKey(r.product_code, r.product_name), a = SA[k];
+    if (a && byProd.has(a.product_id)) {
+      if ((r.order_date || "") < since) return;
+      const units = Number(a.units) || 1, n = (Number(r.qty) || 0) * units;
+      byProd.get(a.product_id).sales.push({ ...r, units, n, per: Number(r.unit_price) / units });
+    } else {
+      const u = unl.get(k) || { key: k, code: r.product_code, name: r.product_name, unit: r.unit, price: r.unit_price, last: r.order_date || "", qty: 0 };
+      u.qty += Number(r.qty) || 0; if ((r.order_date || "") >= u.last) { u.last = r.order_date || ""; u.name = r.product_name; u.price = r.unit_price; }
+      unl.set(k, u);
+    }
+  });
+  S_UNLINKED = [...unl.values()].sort((a, b) => b.qty - a.qty);
+  $("#sUnlinkedN").textContent = S_UNLINKED.length;
+  PROFIT = [...byProd.values()].map(({ c, sales }) => {
+    const cost = costOf(c, mode);
+    const n = sales.reduce((a, s) => a + s.n, 0);
+    const rev = sales.reduce((a, s) => a + s.per * s.n, 0);
+    const avg = n ? rev / n : null;
+    const min = sales.length ? Math.min(...sales.map(s => s.per)) : null;
+    const gp = (avg != null && cost != null) ? avg - cost : null;
+    const rate = (gp != null && avg) ? gp / avg * 100 : null;
+    const lossN = cost != null ? sales.filter(s => s.per < cost).length : 0;
+    return { c, sales, cost, n, avg, min, gp, rate, amount: gp != null ? gp * n : null, lossN };
+  }).filter(x => x.sales.length || Object.values(SA).some(a => a.product_id === x.c.p.id));
+}
+function stateTag(x) {
+  if (x.cost == null) return `<span class="sub">仕入単価なし</span>`;
+  if (!x.sales.length) return `<span class="sub">期間内の販売なし</span>`;
+  if (x.lossN) return `<span class="tag loss">仕入割れ ${x.lossN}件</span>`;
+  if (x.rate < pfWarnVal) return `<span class="tag low">粗利率 低め</span>`;
+  return `<span class="tag done">OK</span>`;
+}
+function drawProfit() {
+  const q = norm($("#pfQ").value), fl = $("#pfFilter").value, so = $("#pfSort").value;
+  const list = PROFIT.filter(x => (!q || norm(x.c.p.name).includes(q)) &&
+    (fl === "loss" ? x.lossN > 0 : fl === "low" ? (x.rate != null && x.rate < pfWarnVal) : true));
+  list.sort(so === "amount" ? (a, b) => (b.amount ?? -1e15) - (a.amount ?? -1e15)
+    : so === "qty" ? (a, b) => b.n - a.n
+    : (a, b) => (a.rate ?? 1e9) - (b.rate ?? 1e9));
+  $("#pfCount").textContent = `${list.length} 商品`;
+  $("#pfEmpty").classList.toggle("hidden", list.length > 0);
+  const u = (x) => esc(x.c.p.compare_unit);
+  $("#pfBody").innerHTML = list.map(x => `<tr class="${x.lossN ? "lossrow" : ""}" data-pid="${x.c.p.id}">
+    <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis"><b>${esc(x.c.p.name)}</b></td><td>1${u(x)}</td>
+    <td class="num">${fmtYen(x.cost)}</td><td class="num">${fmtYen(x.avg)}</td><td class="num">${fmtYen(x.min)}</td>
+    <td class="num ${x.gp != null && x.gp < 0 ? "up" : ""}">${x.gp == null ? "" : (x.gp < 0 ? "−" : "") + fmtYen(Math.abs(x.gp))}</td>
+    <td class="num ${x.rate != null && x.rate < pfWarnVal ? "up" : ""}">${x.rate == null ? "" : x.rate.toFixed(1) + "%"}</td>
+    <td class="num">${fmtQty(x.n)}</td><td class="num">${x.amount == null ? "" : (x.amount < 0 ? "−" : "") + fmtYen(Math.abs(x.amount))}</td>
+    <td>${stateTag(x)}</td></tr>`).join("");
+  document.querySelectorAll("#pfBody tr").forEach(tr => tr.onclick = () => openProfit(tr.dataset.pid));
+}
+function openProfit(pid) {
+  const x = PROFIT.find(y => y.c.p.id === pid); if (!x) return;
+  const unit = esc(x.c.p.compare_unit);
+  const byCust = new Map();
+  x.sales.forEach(s => { const k = s.customer || "（不明）"; const g = byCust.get(k) || { name: k, n: 0, rev: 0, min: Infinity, last: "" };
+    g.n += s.n; g.rev += s.per * s.n; g.min = Math.min(g.min, s.per); if ((s.order_date || "") > g.last) g.last = s.order_date; byCust.set(k, g); });
+  const cust = [...byCust.values()].map(g => ({ ...g, avg: g.rev / g.n })).sort((a, b) => a.avg - b.avg);
+  const rate = (p) => (x.cost == null || !p) ? "" : ((p - x.cost) / p * 100).toFixed(1) + "%";
+  $("#modalBox").innerHTML = `
+    <h3>${esc(x.c.p.name)}</h3>
+    <div class="meta">比べる単位：1${unit}　／　販売の期間：${esc($("#pfDays").selectedOptions[0].text)}　／　仕入単価：${esc($("#pfCost").selectedOptions[0].text)}</div>
+    <div class="pstats">
+      <div><div class="l">仕入単価（1${unit}）</div><div class="v">${fmtYen(x.cost)}</div></div>
+      <div><div class="l">平均販売単価</div><div class="v">${fmtYen(x.avg)}</div></div>
+      <div><div class="l">粗利率</div><div class="v">${x.rate == null ? "" : x.rate.toFixed(1) + "%"}</div></div>
+      <div><div class="l">粗利額（期間）</div><div class="v">${x.amount == null ? "" : fmtYen(x.amount)}</div></div>
+    </div>
+    <h4>医院ごとの販売単価（安い順）</h4>
+    <div class="tablewrap" style="max-height:300px"><table class="ledger">
+      <thead><tr><th>医院名</th><th style="text-align:right">販売数</th><th style="text-align:right">平均単価</th><th style="text-align:right">最安単価</th><th style="text-align:right">粗利率</th><th>最終受注日</th></tr></thead>
+      <tbody>${cust.map(g => `<tr class="${x.cost != null && g.min < x.cost ? "lossrow" : ""}"><td>${esc(g.name)}</td><td class="num">${fmtQty(g.n)}</td>
+        <td class="num">${fmtYen(g.avg)}</td><td class="num">${fmtYen(g.min)}</td><td class="num ${x.cost != null && (g.avg - x.cost) / g.avg * 100 < pfWarnVal ? "up" : ""}">${rate(g.avg)}</td><td class="mono">${esc(g.last)}</td></tr>`).join("")
+        || `<tr><td colspan="6" class="empty">期間内の販売はありません</td></tr>`}</tbody></table></div>
+    <h4>仕入先ごとの最新仕入単価</h4>
+    <div class="tablewrap"><table class="ledger"><tbody>${x.c.priced.map((l, i) => `<tr><td>${i === 0 ? `<span class="tag best">最安</span>` : ""}</td><td>${esc(l.supplier)}</td><td class="mono">${esc(l.date)}</td>
+      <td class="num">${fmtYen(l.perYen)}</td><td class="num">${x.avg ? "この仕入先なら粗利率 " + ((x.avg - l.perYen) / x.avg * 100).toFixed(1) + "%" : ""}</td></tr>`).join("") || `<tr><td class="empty">仕入の価格がありません（為替レート未設定の可能性）</td></tr>`}</tbody></table></div>
+    <h4>結び付けた販売商品</h4>
+    <div class="tablewrap"><table class="ledger"><tbody>${Object.values(SA).filter(a => a.product_id === pid).map(a => `<tr><td class="mono">${esc(a.product_code ?? "")}</td>
+      <td style="white-space:normal">${esc(a.product_name ?? "")}</td><td class="num">販売の1単位＝${fmtQty(a.units)}${unit}</td><td><button class="btn" data-sunlink="${esc(a.alias_key)}">外す</button></td></tr>`).join("")}</tbody></table></div>
+    <div class="actions"><button class="btn" id="pfClose">閉じる</button></div>`;
+  $("#modal").classList.remove("hidden");
+  $("#pfClose").onclick = closeModal;
+  $("#modalBox").querySelectorAll("[data-sunlink]").forEach(b => b.onclick = async () => {
+    if (!confirm("この販売商品を、まとめから外しますか？（受注のデータは変わりません）")) return;
+    const { error } = await sb.from("sales_aliases").delete().eq("alias_key", b.dataset.sunlink);
+    if (error) { alert("失敗しました：" + error.message); return; }
+    delete SA[b.dataset.sunlink]; buildProfit(); drawProfit(); closeModal();
+  });
+}
+
+$("#sLinkBtn").onclick = () => {
+  const opts = PP.slice().sort((a, b) => a.name.localeCompare(b.name, "ja")).map(p => `<option value="${p.id}">${esc(p.name)}（1${esc(p.compare_unit)}）</option>`).join("");
+  $("#modalBox").innerHTML = `
+    <h3>まとめていない販売商品（${S_UNLINKED.length}件・よく売れている順）</h3>
+    <div class="meta">Bカートの販売商品を、「仕入価格」タブでまとめた商品に結び付けます。まとめた商品がまだない場合は、先に仕入価格タブで作ってください。<br>
+      「販売の1単位＝」には、販売の数量1つが比べる単位いくつにあたるかを入れます（例：1セット10箱で、比べる単位が「箱」なら 10）。</div>
+    ${PP.length ? "" : `<div class="alert warn">まとめた商品がまだありません。「仕入価格」タブの「まとめていない商品名」から先に作ってください。</div>`}
+    <div style="max-height:60vh;overflow:auto">${S_UNLINKED.map((u, i) => `<div class="cand" data-i="${i}">
+      <div><b style="font-weight:500">${esc(u.name)}</b><div class="sub">${esc(u.code ?? "")}　/　¥${Number(u.price).toLocaleString("ja-JP")}／${esc(u.unit ?? "")}（販売数 ${fmtQty(u.qty)}・最終 ${esc(u.last)}）</div></div>
+      <div><select class="slSel"><option value="">（まだ結び付けない）</option>${opts}</select></div>
+      <div><input class="slUnits" value="1" style="text-align:right" title="販売の1単位＝比べる単位いくつ"></div>
+      <div class="sub sg"></div></div>`).join("") || `<div class="empty">すべて結び付け済みです</div>`}</div>
+    <div class="actions"><button class="btn" id="slClose">閉じる</button><button class="btn primary" id="slSave">選んだものを保存</button></div>`;
+  $("#modal").classList.remove("hidden");
+  $("#modalBox").querySelectorAll(".cand").forEach(row => { const sg = suggest(S_UNLINKED[Number(row.dataset.i)].name);
+    if (sg) { row.querySelector(".slSel").value = sg.id; row.querySelector(".sg").textContent = "候補あり"; } });
+  $("#slClose").onclick = closeModal;
+  $("#slSave").onclick = async (e) => {
+    const btn = e.target; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>保存中…';
+    const recs = [...$("#modalBox").querySelectorAll(".cand")].map(row => { const u = S_UNLINKED[Number(row.dataset.i)], v = row.querySelector(".slSel").value;
+      return v ? { alias_key: u.key, product_code: u.code, product_name: u.name, product_id: v, units: Number(String(row.querySelector(".slUnits").value).replace(/,/g, "")) || 1 } : null; }).filter(Boolean);
+    if (recs.length) {
+      const { error } = await sb.from("sales_aliases").upsert(recs, { onConflict: "alias_key" });
+      if (error) { alert("保存に失敗しました：" + error.message); btn.disabled = false; btn.textContent = "選んだものを保存"; return; }
+      recs.forEach(r => SA[r.alias_key] = r);
+    }
+    buildProfit(); drawProfit(); closeModal();
+  };
+};
+
+$("#pfCsv").onclick = () => {
+  const head = ["商品", "比べる単位", "仕入単価(円)", "平均販売単価(円)", "最安販売単価(円)", "1単位の粗利(円)", "粗利率(%)", "販売数", "粗利額(円)", "仕入割れの注文数"];
+  const lines = [head, ...PROFIT.map(x => [x.c.p.name, x.c.p.compare_unit, x.cost == null ? "" : Math.round(x.cost), x.avg == null ? "" : Math.round(x.avg),
+    x.min == null ? "" : Math.round(x.min), x.gp == null ? "" : Math.round(x.gp), x.rate == null ? "" : x.rate.toFixed(1), x.n, x.amount == null ? "" : Math.round(x.amount), x.lossN])];
+  const csv = lines.map(r => r.map(c => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" }));
+  a.download = `商品別利益_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+};
 
 $("#prCsv").onclick = () => {
   const head = ["商品名", "請求日", "取引先", "請求書番号", "数量", "単位", "単価", "通貨", "円換算", "前回単価", "前回比(%)"];
