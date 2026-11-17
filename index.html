@@ -111,6 +111,8 @@ dl.kv dd{margin:0}
 .sub{color:var(--sub);font-size:11px}
 .pstats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}
 .pstats > div{border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--accent)}
 .vsw{display:flex;gap:4px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
 .vsw button{border:1px solid var(--line);background:var(--panel);padding:6px 14px;border-radius:6px;color:var(--sub)}
 .vsw button.on{background:var(--accent-soft);border-color:var(--accent-soft);color:var(--accent);font-weight:700}
@@ -246,6 +248,8 @@ tr.lossrow td{background:var(--err-bg)}
           <option value="change">前回比の大きい順</option>
           <option value="name">アルファベット順（A→Z）</option>
           <option value="nameDesc">アルファベット順（Z→A）</option>
+          <option value="kana">あいうえお順（あ→ん）</option>
+          <option value="kanaDesc">あいうえお順（ん→あ）</option>
         </select>
         <button class="btn" id="prCsv">CSV出力</button>
         <span class="count" id="prCount"></span>
@@ -253,7 +257,7 @@ tr.lossrow td{background:var(--err-bg)}
       <div class="tablewrap">
         <table class="ledger">
           <thead><tr>
-            <th>商品名</th><th>最終仕入日</th><th>取引先</th>
+            <th class="sortable" data-sortfor="prSort" title="クリックで並べ替え">商品名 ⇅</th><th>最終仕入日</th><th>取引先</th>
             <th style="text-align:right">最新単価</th><th style="text-align:right">円換算</th>
             <th style="text-align:right">前回単価</th><th style="text-align:right">前回比</th>
             <th style="text-align:right">最安（円）</th><th style="text-align:right">最高（円）</th><th style="text-align:right">仕入回数</th>
@@ -282,6 +286,8 @@ tr.lossrow td{background:var(--err-bg)}
           <option value="spread">価格の幅が大きい順</option>
           <option value="name">アルファベット順（A→Z）</option>
           <option value="nameDesc">アルファベット順（Z→A）</option>
+          <option value="kana">あいうえお順（あ→ん）</option>
+          <option value="kanaDesc">あいうえお順（ん→あ）</option>
         </select>
         <button class="btn" id="spCsv">CSV出力</button>
         <span class="count" id="spCount"></span>
@@ -289,7 +295,7 @@ tr.lossrow td{background:var(--err-bg)}
       <div class="tablewrap">
         <table class="ledger">
           <thead><tr>
-            <th>商品名</th><th>商品管理番号</th><th>最終受注日</th>
+            <th class="sortable" data-sortfor="spSort" title="クリックで並べ替え">商品名 ⇅</th><th>商品管理番号</th><th>最終受注日</th>
             <th style="text-align:right">最新の販売単価</th><th style="text-align:right">平均</th>
             <th style="text-align:right">最安</th><th style="text-align:right">最高</th>
             <th style="text-align:right">販売数</th><th style="text-align:right">医院数</th>
@@ -786,6 +792,13 @@ function closeModal() { $("#modal").classList.add("hidden"); }
 // =========================================================
 let PR_LINES = [], PR_PRODUCTS = [], FX = {};
 const ABC = new Intl.Collator("ja", { sensitivity: "base", numeric: true });
+// 並べ替え用の名前（先頭の【…】［…］などは除く）
+const sortName = (s) => String(s ?? "").replace(/^\s*(【[^】]*】|［[^］]*］|\[[^\]]*\]|\s)+/, "").trim();
+const isKana = (s) => /^[\u3040-\u30FF\u31F0-\u31FF\uFF66-\uFF9F\u4E00-\u9FFF]/.test(sortName(s));
+// アルファベット順：英字の商品名を先に A→Z、そのあと日本語
+const byAlpha = (a, b) => (isKana(a) - isKana(b)) || ABC.compare(sortName(a), sortName(b));
+// あいうえお順：日本語の商品名を先に あ→ん、そのあと英字
+const byKana = (a, b) => (isKana(b) - isKana(a)) || ABC.compare(sortName(a), sortName(b));
 const prKey = (s) => String(s ?? "").toUpperCase().replace(/[^A-Z0-9\u3040-\u30FF\u4E00-\u9FFF]/g, "");
 const jpy = (price, cur) => price == null ? null : (cur === "JPY" ? Number(price) : (FX[cur] ? Number(price) * FX[cur] : null));
 const fmtYen = (n) => n == null ? "" : "¥" + Math.round(n).toLocaleString("ja-JP");
@@ -856,7 +869,8 @@ function drawPrices() {
   let list = PR_PRODUCTS.filter(p => (!sup || p.suppliers.includes(sup)) &&
     (!q || norm(p.name + " " + p.suppliers.join(" ")).includes(q)) &&
     (!fl || (fl === "up" ? p.latest.change > 0.05 : p.latest.change < -0.05)));
-  list.sort(so === "name" ? (a, b) => ABC.compare(a.name, b.name) : so === "nameDesc" ? (a, b) => ABC.compare(b.name, a.name)
+  list.sort(so === "name" ? (a, b) => byAlpha(a.name, b.name) : so === "nameDesc" ? (a, b) => byAlpha(b.name, a.name)
+    : so === "kana" ? (a, b) => byKana(a.name, b.name) : so === "kanaDesc" ? (a, b) => byKana(b.name, a.name)
     : so === "change" ? (a, b) => Math.abs(b.latest.change ?? 0) - Math.abs(a.latest.change ?? 0)
     : (a, b) => b.latest.date.localeCompare(a.latest.date));
   $("#prCount").textContent = `${list.length} 商品`;
@@ -1107,7 +1121,8 @@ function drawSalesPrices() {
   const list = SP_LIST.filter(g => !q || norm(g.name + " " + (g.code || "")).includes(q));
   list.sort(so === "date" ? (a, b) => (b.last.order_date || "").localeCompare(a.last.order_date || "")
     : so === "spread" ? (a, b) => (b.max - b.min) / b.max - (a.max - a.min) / a.max
-    : so === "name" ? (a, b) => ABC.compare(a.name, b.name) : so === "nameDesc" ? (a, b) => ABC.compare(b.name, a.name) : (a, b) => b.n - a.n);
+    : so === "name" ? (a, b) => byAlpha(a.name, b.name) : so === "nameDesc" ? (a, b) => byAlpha(b.name, a.name)
+    : so === "kana" ? (a, b) => byKana(a.name, b.name) : so === "kanaDesc" ? (a, b) => byKana(b.name, a.name) : (a, b) => b.n - a.n);
   $("#spCount").textContent = `${list.length} 商品`;
   $("#spEmpty").classList.toggle("hidden", list.length > 0);
   $("#spBody").innerHTML = list.map(g => `<tr data-k="${esc(g.key)}">
@@ -1149,6 +1164,13 @@ function openSalesPrice(key) {
   $("#modal").classList.remove("hidden");
   $("#spClose").onclick = closeModal;
 }
+document.querySelectorAll("th.sortable").forEach(th => th.onclick = () => {
+  const sel = $("#" + th.dataset.sortfor), order = ["name", "kana"];
+  const i = order.indexOf(sel.value);
+  sel.value = i < 0 ? "name" : i === 0 ? "kana" : sel.options[0].value;
+  sel.dispatchEvent(new Event("input"));
+});
+
 $("#spCsv").onclick = () => {
   const head = ["商品名", "商品管理番号", "最終受注日", "最新の販売単価", "平均", "最安", "最高", "販売数", "医院数"];
   const lines = [head, ...SP_LIST.map(g => [g.name, g.code, g.last.order_date, g.last.unit_price, g.avg == null ? "" : Math.round(g.avg), g.min, g.max, g.n, g.clinics])];
