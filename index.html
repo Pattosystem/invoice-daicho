@@ -162,6 +162,7 @@ tr.lossrow td{background:var(--err-bg)}
       <button data-tab="ledger">台帳</button>
       <button data-tab="price">仕入価格</button>
       <button data-tab="sales">販売価格</button>
+      <button data-tab="arari">粗利</button>
     </nav>
     <div class="who"><span id="userEmail"></span><button class="btn" id="logoutBtn">ログアウト</button></div>
   </header>
@@ -307,6 +308,40 @@ tr.lossrow td{background:var(--err-bg)}
       <div class="sub" style="margin-top:8px">受注台帳に取り込んだBカートの受注（キャンセル・単価0円を除く）から作ります。単価はBカートの「単価」欄の金額です。ここで受注のデータは変わりません。</div>
     </section>
 
+    <!-- 粗利（仕入と販売を自分で紐づける） -->
+    <section id="tab-arari" class="hidden">
+      <div class="toolbar">
+        <button class="btn primary" id="arAdd">＋ 紐づけを追加</button>
+        <input type="search" id="arQ" placeholder="商品名・取引先で検索">
+        <select id="arDays">
+          <option value="30">販売：直近30日</option>
+          <option value="90" selected>販売：直近90日</option>
+          <option value="180">販売：直近180日</option>
+          <option value="365">販売：直近1年</option>
+          <option value="0">販売：すべての期間</option>
+        </select>
+        <select id="arSort">
+          <option value="rate">粗利率の低い順</option>
+          <option value="rateDesc">粗利率の高い順</option>
+          <option value="amount">粗利額の多い順</option>
+          <option value="name">アルファベット順（A→Z）</option>
+          <option value="kana">あいうえお順（あ→ん）</option>
+        </select>
+        <span class="cur sub">注意する粗利率 <input id="arWarn" value="20" style="width:52px;padding:5px 7px;border:1px solid var(--line);border-radius:5px;text-align:right">％未満</span>
+        <button class="btn" id="arCsv">CSV出力</button>
+        <span class="count" id="arCount"></span>
+      </div>
+      <div class="tablewrap"><table class="ledger">
+        <thead><tr>
+          <th class="sortable" data-sortfor="arSort" title="クリックで並べ替え">商品 ⇅</th><th>仕入（取引先）</th>
+          <th style="text-align:right">仕入単価</th><th style="text-align:right">販売単価（平均）</th><th style="text-align:right">最新の販売単価</th>
+          <th style="text-align:right">1個の粗利</th><th style="text-align:right">粗利率</th><th style="text-align:right">販売数</th><th style="text-align:right">粗利額</th><th>メモ</th><th></th>
+        </tr></thead>
+        <tbody id="arBody"></tbody></table>
+        <div class="empty hidden" id="arEmpty">まだ紐づけがありません。「＋ 紐づけを追加」から、仕入の商品と販売の商品を選んでください。</div></div>
+      <div class="sub" style="margin-top:8px">仕入単価は、その取引先の最新の請求書の単価を「仕入価格」タブの為替レートで円にしたもの（送料・関税は含みません）。販売単価は、受注台帳の受注（キャンセル・0円を除く）から計算しています。粗利率＝1個の粗利÷販売単価（平均）。</div>
+    </section>
+
     <!-- 利益（販売データは受注台帳の受注を読むだけ） -->
     <section id="tab-profit" class="hidden">
       <div class="fx">
@@ -389,6 +424,8 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   $("#tab-price").classList.toggle("hidden", b.dataset.tab !== "price");
   $("#tab-profit").classList.toggle("hidden", b.dataset.tab !== "profit");
   $("#tab-sales").classList.toggle("hidden", b.dataset.tab !== "sales");
+  $("#tab-arari").classList.toggle("hidden", b.dataset.tab !== "arari");
+  if (b.dataset.tab === "arari") loadArari();
   if (b.dataset.tab === "profit") loadProfit();
   if (b.dataset.tab === "sales") loadSalesPrices();
   if (b.dataset.tab === "ledger") loadLedger();
@@ -1178,6 +1215,151 @@ $("#spCsv").onclick = () => {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" }));
   a.download = `販売価格_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+};
+
+// =========================================================
+// 粗利（仕入と販売を自分で紐づける。紐づけは profit_links に保存、元のデータは読むだけ）
+// =========================================================
+let AR_LINKS = [], AR_ROWS = [], BUY_ITEMS = [], SELL_ITEMS = [];
+let arWarnVal = 20;
+try { const v = localStorage.getItem("ar_warn"); if (v) arWarnVal = Number(v); } catch (_) {}
+$("#arWarn").value = arWarnVal;
+["arQ", "arDays", "arSort", "arWarn"].forEach(id => $("#" + id).addEventListener("input", () => {
+  if (id === "arWarn") { arWarnVal = Number($("#arWarn").value) || 0; try { localStorage.setItem("ar_warn", arWarnVal); } catch (_) {} }
+  drawArari();
+}));
+document.querySelectorAll('th.sortable[data-sortfor="arSort"]').forEach(th => th.onclick = () => {
+  const sel = $("#arSort"); sel.value = sel.value === "name" ? "kana" : sel.value === "kana" ? "rate" : "name"; drawArari();
+});
+
+async function loadArari() {
+  $("#arCount").innerHTML = '<span class="spinner"></span>読み込み中…';
+  await loadPrices();
+  await loadSalesPrices();
+  const { data, error } = await sb.from("profit_links").select("*").order("created_at");
+  if (error) { $("#arCount").textContent = ""; alert("読み込みに失敗しました：" + error.message); return; }
+  AR_LINKS = data || [];
+  // 仕入の商品（取引先＋商品名ごとの最新）
+  const bm = new Map();
+  PR_LINES.forEach(l => { const k = aliasKey(l.supplier, l.name); const g = bm.get(k);
+    if (!g || l.date >= g.last.date) bm.set(k, { key: k, supplier: l.supplier, name: l.name, last: l }); });
+  BUY_ITEMS = [...bm.values()].sort((a, b) => byAlpha(a.name, b.name)).map(b => ({ ...b,
+    label: `${b.name} ／ ${b.supplier} ／ ${fmtPrice(b.last.price)} ${b.last.currency}` }));
+  // 販売の商品
+  const sm = new Map();
+  SP_ROWS.forEach(r => { const k = r.product_code ? "C:" + prKey(r.product_code) : "N:" + prKey(r.product_name);
+    const g = sm.get(k) || { key: k, code: r.product_code, name: r.product_name, rows: [] }; g.rows.push(r);
+    if ((r.order_date || "") >= (g.lastDate || "")) { g.lastDate = r.order_date || ""; g.name = r.product_name; } sm.set(k, g); });
+  SELL_ITEMS = [...sm.values()].sort((a, b) => byAlpha(a.name, b.name)).map(g => ({ ...g, label: `${g.name}${g.code ? " ［" + g.code + "］" : ""}` }));
+  drawArari();
+}
+
+function computeLink(L) {
+  const b = BUY_ITEMS.find(x => x.key === L.buy_key), s = SELL_ITEMS.find(x => x.key === L.sell_key);
+  const days = Number($("#arDays").value);
+  const since = days ? new Date(Date.now() - days * 86400000).toISOString().slice(0, 10) : "";
+  const factor = Number(L.factor) || 1;
+  const unitYen = b ? jpy(b.last.price, b.last.currency) : null;
+  const cost = unitYen == null ? null : unitYen * factor;
+  const rows = s ? s.rows.filter(r => !since || (r.order_date || "") >= since) : [];
+  const n = rows.reduce((a, r) => a + (Number(r.qty) || 0), 0);
+  const avg = n ? rows.reduce((a, r) => a + Number(r.unit_price) * (Number(r.qty) || 0), 0) / n : null;
+  const latest = s ? s.rows.slice().sort((a, b) => (b.order_date || "").localeCompare(a.order_date || ""))[0] : null;
+  const gp = (avg != null && cost != null) ? avg - cost : null;
+  const rate = (gp != null && avg) ? gp / avg * 100 : null;
+  const lossN = cost != null ? rows.filter(r => Number(r.unit_price) < cost).length : 0;
+  return { L, b, s, factor, cost, n, avg, latest, gp, rate, amount: gp != null ? gp * n : null, lossN,
+    name: L.label || (s ? s.name : L.sell_name) || L.buy_name };
+}
+function drawArari() {
+  AR_ROWS = AR_LINKS.map(computeLink);
+  const q = norm($("#arQ").value), so = $("#arSort").value;
+  const list = AR_ROWS.filter(x => !q || norm([x.name, x.L.buy_name, x.L.buy_supplier, x.L.sell_name, x.L.memo].join(" ")).includes(q));
+  list.sort(so === "rateDesc" ? (a, b) => (b.rate ?? -1e9) - (a.rate ?? -1e9)
+    : so === "amount" ? (a, b) => (b.amount ?? -1e15) - (a.amount ?? -1e15)
+    : so === "name" ? (a, b) => byAlpha(a.name, b.name) : so === "kana" ? (a, b) => byKana(a.name, b.name)
+    : (a, b) => (a.rate ?? 1e9) - (b.rate ?? 1e9));
+  $("#arCount").textContent = `${list.length} 件`;
+  $("#arEmpty").classList.toggle("hidden", list.length > 0);
+  const neg = (v) => v == null ? "" : (v < 0 ? "−" : "") + yen(Math.abs(v));
+  $("#arBody").innerHTML = list.map(x => `<tr class="${x.lossN ? "lossrow" : ""}">
+    <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${esc(x.name)}"><b style="font-weight:500">${esc(x.name)}</b>
+      ${x.factor !== 1 ? `<div class="sub">販売1個＝仕入${fmtQty(x.factor)}個</div>` : ""}</td>
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${esc(x.L.buy_name ?? "")}">${esc(x.L.buy_supplier ?? "")}
+      <div class="sub">${x.b ? fmtPrice(x.b.last.price) + " " + esc(x.b.last.currency) + "・" + esc(x.b.last.date) : "仕入データなし"}</div></td>
+    <td class="num">${x.cost == null ? `<span class="sub">${x.b ? "レート未設定" : "—"}</span>` : yen(x.cost)}</td>
+    <td class="num">${x.avg == null ? `<span class="sub">販売なし</span>` : yen(x.avg)}</td>
+    <td class="num">${x.latest ? yen(x.latest.unit_price) : ""}</td>
+    <td class="num ${x.gp != null && x.gp < 0 ? "up" : ""}">${neg(x.gp)}</td>
+    <td class="num ${x.rate != null && x.rate < arWarnVal ? "up" : ""}">${x.rate == null ? "" : x.rate.toFixed(1) + "%"}${x.lossN ? `<div><span class="tag loss">仕入割れ ${x.lossN}件</span></div>` : ""}</td>
+    <td class="num">${fmtQty(x.n)}</td><td class="num">${neg(x.amount)}</td>
+    <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis" title="${esc(x.L.memo ?? "")}">${esc(x.L.memo ?? "")}</td>
+    <td style="white-space:nowrap"><button class="btn" style="padding:4px 10px;font-size:12px" data-ared="${x.L.id}">修正</button> <button class="btn danger" style="padding:4px 10px;font-size:12px" data-ardel="${x.L.id}">削除</button></td></tr>`).join("");
+  $("#arBody").querySelectorAll("[data-ared]").forEach(b => b.onclick = () => openArari(AR_LINKS.find(l => l.id === b.dataset.ared)));
+  $("#arBody").querySelectorAll("[data-ardel]").forEach(b => b.onclick = async () => {
+    const L = AR_LINKS.find(l => l.id === b.dataset.ardel); if (!L) return;
+    if (!confirm(`「${L.label || L.sell_name}」の紐づけを削除しますか？\n（仕入・販売のデータは消えません）`)) return;
+    const { error } = await sb.from("profit_links").delete().eq("id", L.id);
+    if (error) { alert("削除に失敗しました：" + error.message); return; }
+    AR_LINKS = AR_LINKS.filter(l => l.id !== L.id); drawArari();
+  });
+}
+
+$("#arAdd").onclick = () => openArari(null);
+function openArari(L) {
+  const b0 = L ? BUY_ITEMS.find(x => x.key === L.buy_key) : null, s0 = L ? SELL_ITEMS.find(x => x.key === L.sell_key) : null;
+  $("#modalBox").innerHTML = `
+    <h3>${L ? "紐づけを修正" : "紐づけを追加"}</h3>
+    <div class="meta">仕入の商品と、それを売っている販売の商品を選びます。欄に商品名・取引先・商品管理番号を入れると候補が出ます。</div>
+    <datalist id="buyList">${BUY_ITEMS.map(b => `<option value="${esc(b.label)}">`).join("")}</datalist>
+    <datalist id="sellList">${SELL_ITEMS.map(s => `<option value="${esc(s.label)}">`).join("")}</datalist>
+    <div class="grid" style="grid-template-columns:1fr">
+      <div class="f"><label>仕入（請求書の商品 ／ 取引先 ／ 最新単価）</label><input id="arBuy" list="buyList" value="${esc(b0 ? b0.label : (L ? L.buy_name + " ／ " + L.buy_supplier : ""))}" placeholder="例：jalupro"></div>
+      <div class="f"><label>販売（Bカートの商品）</label><input id="arSell" list="sellList" value="${esc(s0 ? s0.label : (L ? L.sell_name : ""))}" placeholder="例：SB006"></div>
+    </div>
+    <div class="grid">
+      <div class="f"><label>販売1個 ＝ 仕入何個（入数が違うときだけ変更）</label><input id="arFactor" class="num" value="${L ? Number(L.factor) : 1}"></div>
+      <div class="f"><label>表示名（空なら販売の商品名）</label><input id="arLabel" value="${esc(L?.label ?? "")}"></div>
+      <div class="f wide"><label>メモ</label><input id="arMemo" value="${esc(L?.memo ?? "")}"></div>
+    </div>
+    <div class="sub" style="margin-top:6px">例：仕入は1箱単位で、Bカートは「1セット＝10箱」で売っている → 10</div>
+    <div id="arPrev" class="alerts"></div>
+    <div class="actions"><button class="btn" id="arCancel">閉じる</button><button class="btn primary" id="arSave">保存</button></div>`;
+  $("#modal").classList.remove("hidden");
+  const find = () => ({ b: BUY_ITEMS.find(x => x.label === $("#arBuy").value.trim()), s: SELL_ITEMS.find(x => x.label === $("#arSell").value.trim()),
+    f: Number(String($("#arFactor").value).replace(/,/g, "")) || 1 });
+  const preview = () => {
+    const { b, s, f } = find();
+    if (b && !s && !$("#arSell").value.trim()) { const sg = suggestBcart(b.name, SELL_ITEMS); if (sg) { $("#arSell").value = sg.b.label; return preview(); } }
+    if (!b || !s) { $("#arPrev").innerHTML = ""; return; }
+    const x = computeLink({ buy_key: b.key, sell_key: s.key, factor: f });
+    $("#arPrev").innerHTML = `<div class="alert info">仕入単価 ${x.cost == null ? "（為替レート未設定）" : yen(x.cost)}　／　販売単価（平均） ${x.avg == null ? "（販売なし）" : yen(x.avg)}
+      ${x.rate == null ? "" : `　／　<b>粗利率 ${x.rate.toFixed(1)}%</b>（1個あたり ${yen(x.gp)}）`}</div>`;
+  };
+  ["arBuy", "arSell", "arFactor"].forEach(id => $("#" + id).addEventListener("input", preview)); preview();
+  $("#arCancel").onclick = closeModal;
+  $("#arSave").onclick = async () => {
+    const { b, s, f } = find();
+    if (!b) { alert("仕入の商品を、候補の中から選んでください"); return; }
+    if (!s) { alert("販売の商品を、候補の中から選んでください"); return; }
+    const rec = { label: $("#arLabel").value.trim() || null, buy_key: b.key, buy_supplier: b.supplier, buy_name: b.name,
+      sell_key: s.key, sell_code: s.code, sell_name: s.name, factor: f, memo: $("#arMemo").value.trim() || null, updated_at: new Date().toISOString() };
+    const q = L ? sb.from("profit_links").update(rec).eq("id", L.id).select().single() : sb.from("profit_links").insert(rec).select().single();
+    const { data, error } = await q;
+    if (error) { alert("保存に失敗しました：" + error.message); return; }
+    AR_LINKS = L ? AR_LINKS.map(x => x.id === L.id ? data : x) : [...AR_LINKS, data];
+    closeModal(); drawArari();
+  };
+}
+$("#arCsv").onclick = () => {
+  const head = ["商品", "仕入の商品", "仕入の取引先", "販売の商品", "販売1個＝仕入何個", "仕入単価(円)", "販売単価・平均(円)", "最新の販売単価(円)", "1個の粗利(円)", "粗利率(%)", "販売数", "粗利額(円)", "メモ"];
+  const r0 = (v) => v == null ? "" : Math.round(v);
+  const lines = [head, ...AR_ROWS.map(x => [x.name, x.L.buy_name, x.L.buy_supplier, x.L.sell_name, x.factor, r0(x.cost), r0(x.avg), x.latest ? x.latest.unit_price : "",
+    r0(x.gp), x.rate == null ? "" : x.rate.toFixed(1), x.n, r0(x.amount), x.L.memo])];
+  const csv = lines.map(r => r.map(c => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" }));
+  a.download = `粗利_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
 };
 
 // =========================================================
