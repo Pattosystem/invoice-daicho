@@ -7,6 +7,105 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+(function (root, factory) {
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  if (root) root.RemittanceParser = api;
+})(typeof window !== "undefined" ? window : globalThis, function () {
+  "use strict";
+
+  const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+  const pick = (text, re, group = 1) => clean((text.match(re) || [])[group]);
+  const isoDate = (value) => {
+    const m = String(value || "").match(/(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+    return m ? `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}` : "";
+  };
+  const amount = (value) => {
+    if (!value) return null;
+    const n = Number(String(value).replace(/,/g, ""));
+    return Number.isFinite(n) ? n : null;
+  };
+  const lineWith = (lines, label) => lines.find(line => line.includes(label)) || "";
+  const beforeLabel = (line, label) => clean(line.split(label)[0]);
+  const compactCode = (line, re) => ((line.match(re) || []).pop() || "").replace(/\s+/g, "");
+  const lastUpperWords = (line) => {
+    const found = line.match(/\b[A-Z]{2,}(?:\s+[A-Z]{2,})+\b/g) || [];
+    return clean(found[found.length - 1]);
+  };
+
+  function parseRemittanceText(source) {
+    const raw = String(source || "");
+    const text = raw.replace(/[\u00a0\u3000]/g, " ").replace(/\r/g, "\n");
+    const flat = clean(text);
+    const lines = text.split(/\n+/).map(clean).filter(Boolean);
+
+    const result = {
+      receipt_no: pick(flat, /受付番号\s*[：:]?\s*(OMT[A-Z0-9-]{8,})/i),
+      bank_status: pick(flat, /ステータス\s*([^\s]+)/),
+      application_date: isoDate(pick(flat, /お申込日\s*(\d{4}[\/-]\d{1,2}[\/-]\d{1,2})/)),
+      transfer_date: isoDate(pick(flat, /送金指定日\s*(\d{4}[\/-]\d{1,2}[\/-]\d{1,2})/)),
+      applicant_name: pick(flat, /依頼人\(APPLICANT\)\s+(.+?)\s+(?:名前\(NAME\)|住所\(ADDRESS\)|送金人名\(NAME\))/i),
+      beneficiary_name: pick(flat, /受取人名\(NAME\)\s+(.+?)\s+受取人国名\(COUNTRY\)/i),
+      beneficiary_country: pick(flat, /受取人国名\(COUNTRY\)\s+(.+?)\s+受取人取引主体識別子/i),
+      beneficiary_account: pick(flat, /受取人口座\(CREDITOR ACCOUNT\)\s+([A-Z0-9][A-Z0-9 -]{5,}?)(?=\s+BIC\(SWIFT\))/i).replace(/\s+/g, ""),
+      swift_code: pick(flat, /BIC\(SWIFT\)コード\(BICFI\)\s+([A-Z0-9]{8,11})/i),
+      beneficiary_bank: pick(flat, /送金先銀行名\(NAME\)\s+(.+?)\s+送金先国名\(COUNTRY\)/i),
+      bank_country: pick(flat, /送金先国名\(COUNTRY\)\s+(.+?)\s+(?:支店名\(DEPARTMENT\)|出張所名)/i),
+      purpose: pick(flat, /送金理由\(DETAILS\)\s+(.+?)\s+原産地\(ORIGIN\)/i),
+      debtor_ref: pick(flat, /お客様整理番号[\s\S]{0,100}?\(DEBTOR'S REF\. NO\.\)[\s\S]{0,100}?([A-Z0-9-]{3,})(?=\s+参照番号)/i),
+      currency: "",
+      amount: null,
+      notes: [],
+    };
+
+    if (!result.bank_status || result.bank_status === "ステータス") {
+      result.bank_status = beforeLabel(lineWith(lines, "ステータス"), "ステータス");
+    }
+    const dateLine = lineWith(lines, "お申込日");
+    const dates = dateLine.match(/\d{4}[\/-]\d{1,2}[\/-]\d{1,2}/g) || [];
+    if (!result.application_date && dates[0]) result.application_date = isoDate(dates[0]);
+    if ((!result.transfer_date || result.transfer_date === result.application_date) && dates[1]) result.transfer_date = isoDate(dates[1]);
+
+    if (!result.applicant_name) result.applicant_name = beforeLabel(lineWith(lines, "依頼人"), "依頼人");
+    if (!result.beneficiary_name) result.beneficiary_name = beforeLabel(lineWith(lines, "受取人名"), "受取人名");
+    if (!result.beneficiary_country) result.beneficiary_country = lastUpperWords(lineWith(lines, "受取人国名"));
+    if (!result.beneficiary_account) result.beneficiary_account = compactCode(lineWith(lines, "受取人口座"), /[A-Z]{2}\d{2}[A-Z0-9]{10,}/g);
+    if (!result.swift_code) result.swift_code = compactCode(lineWith(lines, "コード"), /[A-Z]{6}[A-Z0-9]{2,5}/g);
+    if (!result.beneficiary_bank) result.beneficiary_bank = beforeLabel(lineWith(lines, "送金先銀行名"), "送金先銀行名");
+    if (!result.bank_country) result.bank_country = lastUpperWords(lineWith(lines, "送金先国名"));
+    if (!result.purpose) {
+      const purposeLine = lines.find(line => line.includes("送金理由") && /\b(?:OTHER|PAYMENT|GOODS|PRODUCT|RAW|MEDICAL)\b/i.test(line)) || "";
+      result.purpose = pick(purposeLine, /\b((?:OTHER|PAYMENT|GOODS|PRODUCT|RAW|MEDICAL)[A-Z0-9 .,&'()\/-]{3,}?)(?=\s+原産地)/i);
+    }
+    if (!result.debtor_ref) {
+      const refLine = lineWith(lines, "お客様整理番号");
+      result.debtor_ref = (refLine.match(/\b\d{3,}\b/g) || []).pop() || "";
+    }
+
+    const amountSection = flat.match(/送金金額\s+([\s\S]{0,220}?)(?=受取人宛支払方法|\(PAYMENT INSTRUCTION\))/i);
+    const amountMatch = (amountSection ? amountSection[1] : flat).match(/\b([A-Z]{3})\s+([\d,]+(?:\.\d+)?)/);
+    if (amountMatch) {
+      result.currency = amountMatch[1].toUpperCase();
+      result.amount = amount(amountMatch[2]);
+    }
+    if (!result.currency || result.amount == null) {
+      const amountLine = lineWith(lines, "送金金額");
+      const reverseAmount = amountLine.match(/([\d,]+(?:\.\d+)?)\s+([A-Z]{3})\s+送金金額/);
+      if (reverseAmount) { result.amount = amount(reverseAmount[1]); result.currency = reverseAmount[2]; }
+    }
+
+    if (!result.receipt_no) result.notes.push("受付番号を読み取れませんでした");
+    if (!result.beneficiary_name) result.notes.push("受取人名を読み取れませんでした");
+    if (!result.currency || result.amount == null) result.notes.push("送金通貨・金額を読み取れませんでした");
+    if (!result.transfer_date) result.notes.push("送金指定日を読み取れませんでした");
+    return result;
+  }
+
+  return { parseRemittanceText, isoDate };
+});
+</script>
 <style>
 :root{
   --bg:#f5f4f0; --panel:#ffffff; --ink:#1d2329; --sub:#5d6670; --line:#dedbd3;
@@ -24,7 +123,7 @@ input,select,textarea{font:inherit;color:inherit}
 /* ヘッダー */
 header{background:var(--panel);border-bottom:1px solid var(--line);padding:0 20px;display:flex;align-items:center;gap:24px;height:56px;position:sticky;top:0;z-index:10}
 header h1{font-size:16px;margin:0;letter-spacing:.04em}
-nav{display:flex;gap:4px}
+nav{display:flex;gap:4px;overflow-x:auto;white-space:nowrap}
 nav button{background:none;border:none;padding:8px 14px;border-radius:6px;color:var(--sub)}
 nav button.on{background:var(--accent-soft);color:var(--accent);font-weight:700}
 header .who{margin-left:auto;color:var(--sub);font-size:12px;display:flex;gap:10px;align-items:center}
@@ -91,7 +190,27 @@ table.ledger tr:hover td{background:#fbfaf7;cursor:pointer}
 .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px}
 .tag.need{background:var(--warn-bg);color:var(--warn)}
 .tag.done{background:var(--ok-bg);color:var(--ok)}
+.tag.partial{background:var(--accent-soft);color:var(--accent)}
 .empty{padding:40px;text-align:center;color:var(--sub)}
+
+/* 送金明細 */
+.remit-drop{border:2px dashed #b9c4cf;border-radius:10px;background:var(--panel);padding:24px;text-align:center;color:var(--sub);transition:.15s;margin-bottom:14px}
+.remit-drop.over{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.remit-drop strong{display:block;font-size:16px;color:var(--ink);margin-bottom:5px}
+.remit-drop .row{margin-top:12px;display:flex;gap:8px;justify-content:center}
+.remit-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:14px 0;overflow:hidden}
+.remit-card .card-body{grid-template-columns:minmax(0,1fr) minmax(0,1.05fr)}
+.remit-card .form{max-height:640px}
+.match-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:12px 0}
+.match-summary>div{border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:#faf9f6}
+.match-summary .l{font-size:11px;color:var(--sub)}
+.match-summary .v{font-family:var(--mono);font-size:16px;margin-top:2px}
+.match-list{border:1px solid var(--line);border-radius:8px;max-height:330px;overflow:auto}
+.match-row{display:grid;grid-template-columns:24px 92px minmax(150px,1.5fr) minmax(100px,1fr) 130px 125px;gap:8px;align-items:center;padding:9px 10px;border-bottom:1px solid #eeece6;font-size:12px}
+.match-row:last-child{border-bottom:0}
+.match-row input[type=number]{width:100%;padding:5px 7px;border:1px solid var(--line);border-radius:5px;text-align:right;font-family:var(--mono)}
+.match-row.suggested{background:var(--accent-soft)}
+.setup-note{padding:12px 14px;border:1px solid #e0a14a;background:var(--warn-bg);color:var(--warn);border-radius:8px;margin-bottom:12px;line-height:1.6}
 
 /* 詳細 */
 #modal{position:fixed;inset:0;background:rgba(20,25,30,.45);display:flex;align-items:flex-start;justify-content:center;padding:5vh 16px;z-index:50;overflow:auto}
@@ -139,6 +258,10 @@ tr.lossrow td{background:var(--err-bg)}
   dl.kv{grid-template-columns:100px 1fr}
   header{gap:12px;padding:0 12px}
   main{padding:16px}
+  .remit-card .card-body{grid-template-columns:1fr}
+  .match-summary{grid-template-columns:1fr}
+  .match-row{grid-template-columns:24px 82px 1fr 110px}
+  .match-row .match-supplier,.match-row .match-no{display:none}
 }
 </style>
 </head>
@@ -160,6 +283,7 @@ tr.lossrow td{background:var(--err-bg)}
     <nav>
       <button data-tab="import" class="on">取込</button>
       <button data-tab="ledger">台帳</button>
+      <button data-tab="remittance">送金明細</button>
       <button data-tab="price">仕入価格</button>
       <button data-tab="sales">販売価格</button>
       <button data-tab="arari">粗利</button>
@@ -200,12 +324,39 @@ tr.lossrow td{background:var(--err-bg)}
         <table class="ledger">
           <thead><tr>
             <th>請求日</th><th>取引先</th><th>請求書番号</th><th>AWB番号</th><th>商品</th>
-            <th style="text-align:right">数量</th><th style="text-align:right">合計</th><th>状態</th>
+            <th style="text-align:right">数量</th><th style="text-align:right">合計</th><th>状態</th><th>送金照合</th>
           </tr></thead>
           <tbody id="ledgerBody"></tbody>
         </table>
         <div class="empty hidden" id="ledgerEmpty">まだ登録がありません</div>
       </div>
+    </section>
+
+    <!-- 送金明細 -->
+    <section id="tab-remittance" class="hidden">
+      <div id="remitSetup" class="setup-note hidden">送金明細用のデータベースがまだ準備されていません。管理者が初期設定を行うと利用できます。</div>
+      <div id="remitDrop" class="remit-drop">
+        <strong>ここに送金明細のPDFをドラッグ＆ドロップ</strong>
+        受付番号・送金日・受取人・通貨・金額などを読み取り、確認してから保存します。
+        <div class="row">
+          <button class="btn" id="remitPickBtn">ファイルを選ぶ</button>
+          <button class="btn" id="remitManualBtn">手入力で登録</button>
+        </div>
+        <input type="file" id="remitFileInput" accept="application/pdf" multiple class="hidden">
+      </div>
+      <div id="remitQueue"></div>
+      <div class="toolbar">
+        <input type="search" id="rmQ" placeholder="受取人・受付番号・銀行・口座で検索">
+        <select id="rmStatus"><option value="">照合状態：すべて</option><option>未照合</option><option>一部照合</option><option>照合済</option></select>
+        <input type="month" id="rmMonth" title="送金月">
+        <button class="btn" id="rmCsv">CSV出力</button>
+        <span class="count" id="rmCount"></span>
+      </div>
+      <div class="tablewrap"><table class="ledger">
+        <thead><tr><th>送金指定日</th><th>受取人</th><th>受付番号</th><th style="text-align:right">送金額</th><th style="text-align:right">照合額</th><th style="text-align:right">差額</th><th>照合状態</th></tr></thead>
+        <tbody id="rmBody"></tbody>
+      </table><div class="empty hidden" id="rmEmpty">送金明細はまだありません</div></div>
+      <div class="sub" style="margin-top:8px">送金1件に複数のINVOICEを紐づけられます。送金額と紐づけた請求額が一致すると「照合済」になります。</div>
     </section>
     <!-- 仕入価格（請求書から読むだけ。請求書のデータは書き換えません） -->
     <section id="tab-price" class="hidden">
@@ -421,6 +572,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x => x.classList.toggle("on", x === b));
   $("#tab-import").classList.toggle("hidden", b.dataset.tab !== "import");
   $("#tab-ledger").classList.toggle("hidden", b.dataset.tab !== "ledger");
+  $("#tab-remittance").classList.toggle("hidden", b.dataset.tab !== "remittance");
   $("#tab-price").classList.toggle("hidden", b.dataset.tab !== "price");
   $("#tab-profit").classList.toggle("hidden", b.dataset.tab !== "profit");
   $("#tab-sales").classList.toggle("hidden", b.dataset.tab !== "sales");
@@ -429,6 +581,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   if (b.dataset.tab === "profit") loadProfit();
   if (b.dataset.tab === "sales") loadSalesPrices();
   if (b.dataset.tab === "ledger") loadLedger();
+  if (b.dataset.tab === "remittance") loadRemittances();
   if (b.dataset.tab === "price") loadPrices();
 });
 
@@ -688,15 +841,28 @@ async function saveInvoice(ctx, btn) {
 }
 
 // ---------- 台帳 ----------
-let LEDGER = [];
+let LEDGER = [], INVOICE_REMIT_LINKS = [], INVOICE_REMITTANCES = [];
 async function loadLedger() {
-  const { data, error } = await sb.from("invoices").select("*, invoice_items(*)").order("invoice_date", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false });
+  const [{ data, error }, linkRes, remitRes] = await Promise.all([
+    sb.from("invoices").select("*, invoice_items(*)").order("invoice_date", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false }),
+    sb.from("remittance_invoice_links").select("invoice_id,remittance_id,allocated_amount"),
+    sb.from("remittances").select("id,receipt_no,transfer_date,beneficiary_name,currency,amount")
+  ]);
   if (error) { alert("読み込みに失敗しました：" + error.message); return; }
   LEDGER = data.map(r => ({ ...r, invoice_items: (r.invoice_items || []).sort((a, b) => a.line_no - b.line_no) }));
+  INVOICE_REMIT_LINKS = linkRes.error ? [] : (linkRes.data || []);
+  INVOICE_REMITTANCES = remitRes.error ? [] : (remitRes.data || []);
   const sel = $("#fSupplier"), cur = sel.value;
   const sups = [...new Set(LEDGER.map(r => r.supplier))].sort();
   sel.innerHTML = `<option value="">取引先：すべて</option>` + sups.map(s => `<option ${s === cur ? "selected" : ""}>${esc(s)}</option>`).join("");
   drawLedger();
+}
+
+function invoiceRemittanceState(invoice) {
+  const links = INVOICE_REMIT_LINKS.filter(x => x.invoice_id === invoice.id);
+  const matched = links.reduce((s, x) => s + Number(x.allocated_amount || 0), 0);
+  const status = !links.length ? "未照合" : Math.abs(Number(invoice.total_amount || 0) - matched) <= 0.01 ? "照合済" : "一部照合";
+  return { links, matched, status };
 }
 ["q", "fSupplier", "fStatus", "fMonth"].forEach(id => $("#" + id).addEventListener("input", drawLedger));
 
@@ -714,18 +880,21 @@ function drawLedger() {
   $("#ledgerBody").innerHTML = rows.map(r => {
     const its = r.invoice_items, qty = its.reduce((s, i) => s + Number(i.quantity ?? 0), 0);
     const name = its[0] ? its[0].description + (its.length > 1 ? ` 他${its.length - 1}件` : "") : "";
+    const rm = invoiceRemittanceState(r);
     return `<tr data-id="${r.id}">
       <td class="mono">${esc(r.invoice_date ?? "")}</td><td>${esc(r.supplier)}</td>
       <td class="mono">${esc(r.invoice_no)}</td><td class="mono">${esc(r.awb_no ?? "")}</td>
       <td>${esc(name)}</td><td class="mono" style="text-align:right">${fmtQty(qty)}</td>
       <td class="mono" style="text-align:right">${fmt(r.total_amount)} ${esc(r.currency ?? "")}</td>
-      <td><span class="tag ${r.status === "要確認" ? "need" : "done"}">${esc(r.status)}</span></td></tr>`;
+      <td><span class="tag ${r.status === "要確認" ? "need" : "done"}">${esc(r.status)}</span></td>
+      <td>${remitStatusHtml(rm.status)}</td></tr>`;
   }).join("");
   document.querySelectorAll("#ledgerBody tr").forEach(tr => tr.onclick = () => openDetail(tr.dataset.id));
 }
 
 function openDetail(id) {
   const r = LEDGER.find(x => x.id === id); if (!r) return;
+  const rm = invoiceRemittanceState(r);
   $("#modalBox").innerHTML = `
     <h3>${esc(r.supplier)}　${esc(r.invoice_no)}</h3>
     <div class="meta">登録日時 ${new Date(r.created_at).toLocaleString("ja-JP")}${r.pdf_name ? "　/　" + esc(r.pdf_name) : ""}</div>
@@ -734,6 +903,10 @@ function openDetail(id) {
       <dt>合計</dt><dd class="mono">${fmt(r.total_amount)} ${esc(r.currency ?? "")}</dd><dt>取引条件</dt><dd>${esc(r.incoterm ?? "")}</dd>
       <dt>送り先</dt><dd>${esc(r.ship_to ?? "")}</dd><dt></dt><dd></dd>
     </dl>
+    <div class="alert ${rm.status === "照合済" ? "ok" : rm.status === "一部照合" ? "info" : "warn"}" style="margin:12px 0">
+      送金照合：${esc(rm.status)}${rm.links.length ? `（${fmt(rm.matched)} ${esc(r.currency || "")}）` : ""}
+      ${rm.links.map(x => { const m = INVOICE_REMITTANCES.find(y => y.id === x.remittance_id); return m ? `<button class="btn" data-open-remit="${m.id}" style="margin-left:8px;padding:3px 8px">${esc(m.receipt_no)}</button>` : ""; }).join("")}
+    </div>
     <h4>明細</h4>
     <table class="items"><thead><tr><th>商品名</th><th>HSコード</th><th style="text-align:right">数量</th><th>単位</th><th style="text-align:right">単価</th><th style="text-align:right">小計</th><th>原産</th></tr></thead>
     <tbody>${r.invoice_items.map(i => `<tr><td>${esc(i.description)}</td><td class="mono">${esc(i.hs_code ?? "")}</td>
@@ -755,6 +928,7 @@ function openDetail(id) {
       <button class="btn primary" id="dSave">保存</button>
     </div>`;
   $("#modal").classList.remove("hidden");
+  document.querySelectorAll("[data-open-remit]").forEach(b => b.onclick = async () => { await loadRemittances(); openRemittanceDetail(b.dataset.openRemit); });
   $("#dClose").onclick = closeModal;
   $("#dEdit").onclick = () => editDetail(r);
   if (r.pdf_path) $("#dPdf").onclick = async () => {
@@ -823,6 +997,316 @@ async function updateInvoice(ctx, btn) {
 }
 
 function closeModal() { $("#modal").classList.add("hidden"); }
+
+// =========================================================
+// 送金明細（PDF読取・保存・INVOICE照合）
+// =========================================================
+if (window.pdfjsLib) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+}
+
+let REMITS = [], REMIT_INVOICES = [];
+const REMIT_FIELDS = [
+  ["receipt_no", "受付番号", "text"], ["bank_status", "銀行ステータス", "text"],
+  ["application_date", "申込日", "date"], ["transfer_date", "送金指定日", "date"],
+  ["applicant_name", "依頼人", "text"], ["beneficiary_name", "受取人", "text"],
+  ["beneficiary_country", "受取人国", "text"], ["currency", "通貨", "text"],
+  ["amount", "送金額", "num"], ["beneficiary_account", "受取人口座", "text"],
+  ["swift_code", "SWIFTコード", "text"], ["beneficiary_bank", "送金先銀行", "text"],
+  ["bank_country", "銀行所在国", "text"], ["debtor_ref", "お客様整理番号", "text"],
+  ["purpose", "送金理由", "text"],
+];
+
+const remitDrop = $("#remitDrop");
+["dragenter", "dragover"].forEach(ev => remitDrop.addEventListener(ev, e => { e.preventDefault(); remitDrop.classList.add("over"); }));
+["dragleave", "drop"].forEach(ev => remitDrop.addEventListener(ev, e => { e.preventDefault(); remitDrop.classList.remove("over"); }));
+remitDrop.addEventListener("drop", e => handleRemittanceFiles(e.dataTransfer.files));
+$("#remitPickBtn").onclick = () => $("#remitFileInput").click();
+$("#remitFileInput").onchange = e => { handleRemittanceFiles(e.target.files); e.target.value = ""; };
+$("#remitManualBtn").onclick = () => addRemittanceCard(null, { notes: [] });
+
+function handleRemittanceFiles(list) {
+  [...list].forEach(file => {
+    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+      alert(file.name + " はPDFではありません"); return;
+    }
+    addRemittanceCard(file);
+  });
+}
+
+async function extractPdfText(file) {
+  if (!window.pdfjsLib) throw new Error("PDF読取ライブラリを読み込めませんでした");
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const pdf = await pdfjsLib.getDocument({
+    data: bytes,
+    cMapUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/",
+    cMapPacked: true,
+    standardFontDataUrl: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/standard_fonts/"
+  }).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    pages.push(content.items.map(x => x.str + (x.hasEOL ? "\n" : " ")).join(""));
+  }
+  return pages.join("\n");
+}
+
+function addRemittanceCard(file, initial) {
+  const card = document.createElement("div");
+  card.className = "remit-card";
+  card.innerHTML = `
+    <div class="card-head"><span class="fname">${esc(file ? file.name : "手入力")}</span>
+      <span class="state">${file ? '<span class="spinner"></span>読み取り中…' : "入力してください"}</span></div>
+    <div class="card-body" ${file ? "" : 'style="grid-template-columns:1fr"'}>
+      ${file ? `<iframe src="${URL.createObjectURL(file)}#view=FitH"></iframe>` : ""}
+      <div class="form"></div>
+    </div>`;
+  $("#remitQueue").prepend(card);
+  const ctx = { card, file };
+  if (initial) renderRemittanceForm(ctx, initial);
+  else readRemittancePdf(ctx);
+}
+
+async function readRemittancePdf(ctx) {
+  const state = $(".state", ctx.card);
+  try {
+    const text = await extractPdfText(ctx.file);
+    const data = RemittanceParser.parseRemittanceText(text);
+    state.textContent = "読み取り完了・内容を確認してください";
+    renderRemittanceForm(ctx, data);
+  } catch (e) {
+    state.textContent = "読み取りに失敗（手入力できます）";
+    renderRemittanceForm(ctx, { notes: ["自動読み取りに失敗しました：" + e.message] });
+  }
+}
+
+function renderRemittanceForm(ctx, rem) {
+  const form = $(".form", ctx.card);
+  form.innerHTML = `
+    <div class="grid">${REMIT_FIELDS.map(([k, label, type]) => `
+      <div class="f ${k === "purpose" ? "wide" : ""}"><label>${label}</label>
+        <input data-rk="${k}" type="${type === "date" ? "date" : "text"}" class="${type === "num" ? "num" : ""}"
+          value="${esc(type === "num" && rem[k] != null ? fmt(rem[k]) : rem[k])}"></div>`).join("")}
+      <div class="f wide"><label>メモ</label><textarea data-rk="memo" rows="2">${esc(rem.memo)}</textarea></div>
+    </div>
+    <div class="alerts">${(rem.notes || []).map(t => `<div class="alert info">読み取りメモ：${esc(t)}</div>`).join("")}</div>
+    <div class="actions"><button class="btn danger" data-ract="discard">破棄</button><button class="btn primary" data-ract="save">送金明細を保存</button></div>`;
+  form.onclick = e => {
+    if (e.target.dataset.ract === "discard" && confirm("この送金明細を破棄しますか？")) ctx.card.remove();
+    if (e.target.dataset.ract === "save") saveRemittance(ctx, e.target);
+  };
+}
+
+function collectRemittance(ctx) {
+  const v = {};
+  ctx.card.querySelectorAll("[data-rk]").forEach(i => v[i.dataset.rk] = i.value.trim());
+  v.currency = (v.currency || "").toUpperCase();
+  v.amount = toNum(v.amount);
+  return v;
+}
+
+async function saveRemittance(ctx, btn) {
+  const v = collectRemittance(ctx);
+  const required = [];
+  if (!v.receipt_no) required.push("受付番号");
+  if (!v.beneficiary_name) required.push("受取人");
+  if (!v.currency) required.push("通貨");
+  if (v.amount == null) required.push("送金額");
+  if (required.length) { alert("保存できません。次の項目を確認してください：\n・" + required.join("\n・")); return; }
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>保存中…';
+  let pdf_path = null;
+  try {
+    const { data: duplicate } = await sb.from("remittances").select("id").eq("receipt_no", v.receipt_no).maybeSingle();
+    if (duplicate) throw new Error("この受付番号はすでに登録されています");
+    if (ctx.file) {
+      const ym = (v.transfer_date || v.application_date || new Date().toISOString().slice(0, 10)).slice(0, 7);
+      pdf_path = `${ym}/${crypto.randomUUID()}.pdf`;
+      const upload = await sb.storage.from("remittance-pdfs").upload(pdf_path, ctx.file, { contentType: "application/pdf" });
+      if (upload.error) throw upload.error;
+    }
+    const { error } = await sb.from("remittances").insert({
+      receipt_no: v.receipt_no, bank_status: v.bank_status || null,
+      application_date: v.application_date || null, transfer_date: v.transfer_date || null,
+      applicant_name: v.applicant_name || null, beneficiary_name: v.beneficiary_name,
+      beneficiary_country: v.beneficiary_country || null, beneficiary_account: v.beneficiary_account || null,
+      swift_code: v.swift_code || null, beneficiary_bank: v.beneficiary_bank || null,
+      bank_country: v.bank_country || null, currency: v.currency, amount: v.amount,
+      purpose: v.purpose || null, debtor_ref: v.debtor_ref || null, memo: v.memo || null,
+      pdf_path, pdf_name: ctx.file ? ctx.file.name : null,
+    });
+    if (error) throw error;
+    $(".state", ctx.card).textContent = "保存しました";
+    $(".card-body", ctx.card).innerHTML = `<div class="form"><div class="alert ok">✓ ${esc(v.beneficiary_name)} / ${fmt(v.amount)} ${esc(v.currency)} を保存しました</div></div>`;
+    setTimeout(() => ctx.card.remove(), 3000);
+    loadRemittances();
+  } catch (e) {
+    if (pdf_path) await sb.storage.from("remittance-pdfs").remove([pdf_path]);
+    const missing = /remittances|schema cache|relation/i.test(String(e.message || e));
+    $("#remitSetup").classList.toggle("hidden", !missing);
+    alert("保存に失敗しました：" + (missing ? "送金明細用データベースの初期設定が必要です" : (e.message || e)));
+    btn.disabled = false; btn.textContent = "送金明細を保存";
+  }
+}
+
+function remittanceTotals(r) {
+  const matched = (r.remittance_invoice_links || []).reduce((s, x) => s + Number(x.allocated_amount || 0), 0);
+  const diff = Number(r.amount || 0) - matched;
+  const status = !r.remittance_invoice_links?.length ? "未照合" : Math.abs(diff) <= 0.01 ? "照合済" : "一部照合";
+  return { matched, diff, status };
+}
+
+async function loadRemittances() {
+  const [r1, r2] = await Promise.all([
+    sb.from("remittances").select("*, remittance_invoice_links(invoice_id,allocated_amount)").order("transfer_date", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false }),
+    sb.from("invoices").select("id,supplier,invoice_no,invoice_date,currency,total_amount").order("invoice_date", { ascending: false, nullsFirst: false })
+  ]);
+  if (r1.error) {
+    const missing = /remittances|schema cache|relation/i.test(r1.error.message);
+    $("#remitSetup").classList.toggle("hidden", !missing);
+    if (!missing) alert("送金明細の読み込みに失敗しました：" + r1.error.message);
+    REMITS = []; REMIT_INVOICES = r2.data || []; drawRemittances(); return;
+  }
+  $("#remitSetup").classList.add("hidden");
+  REMITS = r1.data || [];
+  REMIT_INVOICES = r2.data || [];
+  drawRemittances();
+}
+
+["rmQ", "rmStatus", "rmMonth"].forEach(id => $("#" + id).addEventListener("input", drawRemittances));
+function filteredRemittances() {
+  const q = norm($("#rmQ").value), status = $("#rmStatus").value, month = $("#rmMonth").value;
+  return REMITS.filter(r => {
+    const totals = remittanceTotals(r);
+    return (!status || totals.status === status) && (!month || (r.transfer_date || r.application_date || "").startsWith(month)) &&
+      (!q || norm([r.beneficiary_name, r.receipt_no, r.beneficiary_bank, r.beneficiary_account, r.swift_code, r.debtor_ref].join(" ")).includes(q));
+  });
+}
+const remitStatusHtml = status => `<span class="tag ${status === "照合済" ? "done" : status === "一部照合" ? "partial" : "need"}">${status}</span>`;
+function drawRemittances() {
+  const rows = filteredRemittances();
+  $("#rmCount").textContent = `${rows.length} 件`;
+  $("#rmEmpty").classList.toggle("hidden", rows.length > 0);
+  $("#rmBody").innerHTML = rows.map(r => {
+    const t = remittanceTotals(r);
+    return `<tr data-rid="${r.id}"><td class="mono">${esc(r.transfer_date || r.application_date || "")}</td><td>${esc(r.beneficiary_name)}</td>
+      <td class="mono">${esc(r.receipt_no)}</td><td class="mono" style="text-align:right">${fmt(r.amount)} ${esc(r.currency)}</td>
+      <td class="mono" style="text-align:right">${fmt(t.matched)} ${esc(r.currency)}</td><td class="mono" style="text-align:right">${fmt(t.diff)} ${esc(r.currency)}</td>
+      <td>${remitStatusHtml(t.status)}</td></tr>`;
+  }).join("");
+  document.querySelectorAll("#rmBody tr").forEach(tr => tr.onclick = () => openRemittanceDetail(tr.dataset.rid));
+}
+
+const remitPartyKey = s => String(s || "").toUpperCase().replace(/\b(CO|LTD|LIMITED|INC|CORP|GMBH|SA|SRL|PLC)\b/g, " ").replace(/[^A-Z0-9]/g, "");
+function remittanceCandidates(remittance) {
+  const existing = new Set((remittance.remittance_invoice_links || []).map(x => x.invoice_id));
+  const usedElsewhere = new Set(REMITS.filter(r => r.id !== remittance.id).flatMap(r => (r.remittance_invoice_links || []).map(x => x.invoice_id)));
+  const party = remitPartyKey(remittance.beneficiary_name);
+  const t = remittance.transfer_date ? new Date(remittance.transfer_date).getTime() : Date.now();
+  return REMIT_INVOICES.filter(inv => existing.has(inv.id) || (
+    !usedElsewhere.has(inv.id) && (!remittance.currency || inv.currency === remittance.currency) &&
+    (!inv.invoice_date || Math.abs(t - new Date(inv.invoice_date).getTime()) <= 365 * 86400000)
+  )).map(inv => {
+    const ik = remitPartyKey(inv.supplier), days = inv.invoice_date ? Math.round((t - new Date(inv.invoice_date).getTime()) / 86400000) : 999;
+    const partyMatch = !!party && !!ik && (party.includes(ik) || ik.includes(party));
+    const score = (partyMatch ? 6 : 0) + (inv.currency === remittance.currency ? 2 : 0) + (days >= 0 && days <= 180 ? 3 : 0) + (Math.abs(Number(inv.total_amount) - Number(remittance.amount)) <= 0.01 ? 5 : 0);
+    return { ...inv, score, partyMatch, days };
+  }).sort((a, b) => b.score - a.score || String(b.invoice_date || "").localeCompare(String(a.invoice_date || "")));
+}
+
+function suggestRemittanceIds(remittance, candidates) {
+  const eligible = candidates.filter(x => x.partyMatch && x.currency === remittance.currency && x.days >= 0 && x.days <= 180 && x.total_amount != null).slice(0, 16);
+  const target = Math.round(Number(remittance.amount || 0) * 100);
+  let answer = null;
+  function dfs(i, sum, ids) {
+    if (answer || sum > target) return;
+    if (Math.abs(sum - target) <= 1) { answer = [...ids]; return; }
+    if (i >= eligible.length) return;
+    dfs(i + 1, sum + Math.round(Number(eligible[i].total_amount) * 100), [...ids, eligible[i].id]);
+    dfs(i + 1, sum, ids);
+  }
+  dfs(0, 0, []);
+  return answer || [];
+}
+
+function openRemittanceDetail(id) {
+  const r = REMITS.find(x => x.id === id); if (!r) return;
+  const totals = remittanceTotals(r), candidates = remittanceCandidates(r), existing = new Map((r.remittance_invoice_links || []).map(x => [x.invoice_id, Number(x.allocated_amount)]));
+  const suggested = new Set(suggestRemittanceIds(r, candidates));
+  $("#modalBox").innerHTML = `
+    <h3>${esc(r.beneficiary_name)}　${fmt(r.amount)} ${esc(r.currency)}</h3>
+    <div class="meta">受付番号 ${esc(r.receipt_no)}　/　登録日時 ${new Date(r.created_at).toLocaleString("ja-JP")}</div>
+    <dl class="kv"><dt>申込日</dt><dd class="mono">${esc(r.application_date || "")}</dd><dt>送金指定日</dt><dd class="mono">${esc(r.transfer_date || "")}</dd>
+      <dt>銀行ステータス</dt><dd>${esc(r.bank_status || "")}</dd><dt>依頼人</dt><dd>${esc(r.applicant_name || "")}</dd>
+      <dt>受取人口座</dt><dd class="mono">${esc(r.beneficiary_account || "")}</dd><dt>SWIFT</dt><dd class="mono">${esc(r.swift_code || "")}</dd>
+      <dt>送金先銀行</dt><dd>${esc(r.beneficiary_bank || "")}</dd><dt>送金理由</dt><dd>${esc(r.purpose || "")}</dd></dl>
+    <h4>INVOICEとの照合</h4>
+    <div class="match-summary"><div><div class="l">送金額</div><div class="v" id="rmSumAmount">${fmt(r.amount)} ${esc(r.currency)}</div></div>
+      <div><div class="l">選択した請求額</div><div class="v" id="rmSumSelected">${fmt(totals.matched)} ${esc(r.currency)}</div></div>
+      <div><div class="l">差額</div><div class="v" id="rmSumDiff">${fmt(totals.diff)} ${esc(r.currency)}</div></div></div>
+    <div class="toolbar"><button class="btn" id="rmSuggest" ${suggested.size ? "" : "disabled"}>金額が一致する候補を自動選択</button><span class="sub">受取人・通貨・日付・金額から候補を絞っています</span></div>
+    <div class="match-list" id="rmMatchList">${candidates.length ? candidates.map(inv => {
+      const checked = existing.has(inv.id), val = checked ? existing.get(inv.id) : Number(inv.total_amount || 0);
+      return `<label class="match-row ${suggested.has(inv.id) ? "suggested" : ""}" data-iid="${inv.id}"><input type="checkbox" class="rm-check" ${checked ? "checked" : ""}>
+        <span class="mono">${esc(inv.invoice_date || "")}</span><span class="match-supplier">${esc(inv.supplier)}</span><span class="match-no mono">${esc(inv.invoice_no)}</span>
+        <span class="mono" style="text-align:right">${fmt(inv.total_amount)} ${esc(inv.currency || "")}</span>
+        <input class="rm-alloc" type="number" step="0.01" min="0" value="${val}" ${checked ? "" : "disabled"}></label>`;
+    }).join("") : '<div class="empty">照合候補のINVOICEがありません</div>'}</div>
+    <div class="f wide" style="margin-top:12px"><label>メモ</label><textarea id="rmMemo" rows="2">${esc(r.memo || "")}</textarea></div>
+    <div class="actions">${r.pdf_path ? '<button class="btn" id="rmPdf">PDFを開く</button>' : ""}<button class="btn danger" id="rmDelete">削除</button><span style="flex:1"></span>
+      <button class="btn" id="rmClose">閉じる</button><button class="btn primary" id="rmSaveMatch">照合内容を保存</button></div>`;
+  $("#modal").classList.remove("hidden");
+  const updateSummary = () => {
+    let selected = 0;
+    document.querySelectorAll("#rmMatchList .match-row").forEach(row => {
+      const check = $(".rm-check", row), input = $(".rm-alloc", row); input.disabled = !check.checked;
+      if (check.checked) selected += Number(input.value || 0);
+    });
+    $("#rmSumSelected").textContent = `${fmt(selected)} ${r.currency}`;
+    $("#rmSumDiff").textContent = `${fmt(Number(r.amount) - selected)} ${r.currency}`;
+  };
+  $("#rmMatchList").addEventListener("input", updateSummary);
+  $("#rmClose").onclick = closeModal;
+  $("#rmSuggest").onclick = () => {
+    document.querySelectorAll("#rmMatchList .match-row").forEach(row => {
+      const on = suggested.has(row.dataset.iid); $(".rm-check", row).checked = on; $(".rm-alloc", row).value = Number(REMIT_INVOICES.find(x => x.id === row.dataset.iid)?.total_amount || 0);
+    }); updateSummary();
+  };
+  if (r.pdf_path) $("#rmPdf").onclick = async () => {
+    const w = window.open("", "_blank"); const { data, error } = await sb.storage.from("remittance-pdfs").createSignedUrl(r.pdf_path, 600);
+    if (error) { w.close(); alert("PDFを開けませんでした"); return; } w.location = data.signedUrl;
+  };
+  $("#rmSaveMatch").onclick = () => saveRemittanceMatches(r);
+  $("#rmDelete").onclick = async () => {
+    if (!confirm(`${r.receipt_no} の送金明細を削除します。元に戻せません。よろしいですか？`)) return;
+    const { error } = await sb.from("remittances").delete().eq("id", r.id);
+    if (error) { alert("削除に失敗しました：" + error.message); return; }
+    if (r.pdf_path) await sb.storage.from("remittance-pdfs").remove([r.pdf_path]);
+    closeModal(); loadRemittances();
+  };
+}
+
+async function saveRemittanceMatches(r) {
+  const links = [...document.querySelectorAll("#rmMatchList .match-row")].filter(row => $(".rm-check", row).checked).map(row => ({
+    remittance_id: r.id, invoice_id: row.dataset.iid, allocated_amount: Number($(".rm-alloc", row).value || 0)
+  }));
+  if (links.some(x => !Number.isFinite(x.allocated_amount) || x.allocated_amount < 0)) { alert("照合額を確認してください"); return; }
+  const old = (r.remittance_invoice_links || []).map(x => ({ remittance_id: r.id, invoice_id: x.invoice_id, allocated_amount: x.allocated_amount }));
+  const btn = $("#rmSaveMatch"); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>保存中…';
+  try {
+    const del = await sb.from("remittance_invoice_links").delete().eq("remittance_id", r.id); if (del.error) throw del.error;
+    if (links.length) { const ins = await sb.from("remittance_invoice_links").insert(links); if (ins.error) { if (old.length) await sb.from("remittance_invoice_links").insert(old); throw ins.error; } }
+    const up = await sb.from("remittances").update({ memo: $("#rmMemo").value || null, updated_at: new Date().toISOString() }).eq("id", r.id); if (up.error) throw up.error;
+    closeModal(); await loadRemittances(); await loadLedger();
+  } catch (e) { alert("照合内容の保存に失敗しました：" + (e.message || e)); btn.disabled = false; btn.textContent = "照合内容を保存"; }
+}
+
+$("#rmCsv").onclick = () => {
+  const lines = [["送金指定日","申込日","受取人","受付番号","通貨","送金額","照合額","差額","照合状態","受取人口座","SWIFT","送金先銀行","送金理由","メモ"]];
+  filteredRemittances().forEach(r => { const t = remittanceTotals(r); lines.push([r.transfer_date,r.application_date,r.beneficiary_name,r.receipt_no,r.currency,r.amount,t.matched,t.diff,t.status,r.beneficiary_account,r.swift_code,r.beneficiary_bank,r.purpose,r.memo]); });
+  const csv = lines.map(row => row.map(c => `"${String(c ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv" })); a.download = `送金明細_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+};
 
 // =========================================================
 // 仕入価格（請求書の明細を読むだけ。書き込むのは為替レートの表だけ）
